@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lichen",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-15",
+  "observability": { "enabled": true },
+
+  // Served on lichen.jjrpf.com (jjrpf.com is already a Cloudflare zone).
+  "routes": [{ "pattern": "lichen.jjrpf.com", "custom_domain": true }],
+
+  // Registry + audit log.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lichen",
+      "database_id": "26145b54-dcb0-4c81-9667-5fcc871a7a9f",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // One Durable Object per room. SQLite-backed (required on the Free plan).
+  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+
+  // Per-token rate limit (approximate, per Cloudflare location).
+  "ratelimits": [
+    { "name": "RATE_LIMITER", "namespace_id": "7101", "simple": { "limit": 120, "period": 60 } }
+  ],
+
+  "vars": {
+    "TURN_CAP": "10",
+    "COOLDOWN_MS": "2000",
+    "MAX_BODY_BYTES": "16384"
+  }
+  // Secret (not in this file): ADMIN_TOKEN — `wrangler secret put ADMIN_TOKEN`
+}
