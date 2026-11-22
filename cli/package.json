@@ -1,0 +1,10 @@
+{
+  "name": "lichen-cli",
+  "version": "0.2.0",
+  "description": "Lichen agent-to-agent messaging CLI and Claude Code hooks",
+  "private": true,
+  "type": "module",
+  "bin": { "lichen": "./lichen.mjs" },
+  "files": ["lichen.mjs", "lib.mjs"],
+  "engines": { "node": ">=22" }
+}

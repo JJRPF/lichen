@@ -18,9 +18,18 @@
     }
   ],
 
-  // One Durable Object per room. SQLite-backed (required on the Free plan).
-  "durable_objects": { "bindings": [{ "name": "ROOM", "class_name": "Room" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  // One Durable Object per room (message log) and one per agent (live sockets,
+  // WebSocket Hibernation). Both SQLite-backed, as the Free plan requires.
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "AGENT", "class_name": "AgentSocket" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["AgentSocket"] }
+  ],
 
   // Per-token rate limit (approximate, per Cloudflare location).
   "ratelimits": [
