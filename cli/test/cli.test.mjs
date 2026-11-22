@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  checkUrl, cursorFor, decodeCursor, encodeCursor, fence, oneLine, parseNotice, renderInbox, hooksSnippet,
+  checkUrl, cursorFor, decodeCursor, encodeCursor, fence, oneLine, parseNotice, renderInbox, hooksSnippet, preToolUseHook,
 } from "../lib.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "lichen.mjs");
@@ -48,6 +48,9 @@ before(async () => {
       if (url.pathname === "/send") return send(201, { id: "r_a:9", room: "r_a", seq: 9 });
       if (url.pathname === "/ack") return send(200, { ok: true, rooms: 1 });
       if (url.pathname === "/react") return send(201, { id: "r_a:10", no_turn: true });
+      if (url.pathname === "/dm") return send(202, { status: "pending", approval_id: "apr_x", approval_url: "https://lichen.test/approvals#apr_x" });
+      if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
+      if (url.pathname.startsWith("/i/")) return send(200, { status: "joined", room: "r_a", agent_id: "agt_me" });
       return send(404, { error: "not_found" });
     });
   });
@@ -151,11 +154,37 @@ describe("commands", () => {
     assert.equal(requests[0].auth, `Bearer ${TOKEN}`);
   });
 
+  test("dm prints the approval link when the request waits on an owner", async () => {
+    const r = await run(["dm", "agt_them", "hello", "--intent", "question"]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(requests[0].body, { to: "agt_them", body: "hello", reply_requested: true, intent: "question" });
+    assert.match(r.stderr, /Waiting for approval: https:\/\/lichen\.test\/approvals#apr_x/);
+  });
+
+  test("join takes a code or a full invite URL; invite posts the room", async () => {
+    await run(["join", "https://lichen.jjrpf.com/i/abcdefgh2345mnpq"]);
+    await run(["join", "abcdefgh2345mnpq"]);
+    assert.deepEqual(requests.map((q) => q.path), ["/i/abcdefgh2345mnpq", "/i/abcdefgh2345mnpq"]);
+    assert.equal((await run(["join", "../../etc"])).code, 1);
+  });
+
+  test("rotate saves the new token into the token file (0600) and never prints it", async () => {
+    writeFileSync(join(home, "token.json"), JSON.stringify({ agent_id: "agt_me", token: TOKEN, base_url: base }));
+    const r = await run(["rotate"], { env: { LICHEN_TOKEN: "", LICHEN_URL: "" } });
+    assert.equal(r.code, 0, r.stderr);
+    assert.doesNotMatch(r.stdout, /lch_rotated/);
+    const saved = JSON.parse(readFileSync(join(home, "token.json"), "utf8"));
+    assert.equal(saved.token, "lch_rotated");
+    assert.equal(saved.agent_id, "agt_me");
+    assert.equal(statSync(join(home, "token.json")).mode & 0o777, 0o600);
+  });
+
   test("hooks prints a settings.json snippet", async () => {
     const r = await run(["hooks"]);
     const s = JSON.parse(r.stdout);
     assert.match(s.hooks.SessionStart[0].hooks[0].command, /lichen\.mjs" hook session-start$/);
     assert.match(s.hooks.Stop[0].hooks[0].command, /lichen\.mjs" hook stop$/);
+    assert.match(s.hooks.PreToolUse[0].hooks[0].command, /lichen\.mjs" hook pre-tool-use$/);
   });
 });
 
@@ -228,6 +257,48 @@ describe("Claude Code hooks", () => {
     assert.equal(noTok.stdout, "");
   });
 
+  const external = (room, seq) => msg(room, seq, { envelope: { sender_id: "agt_x", sender_owner_id: "github:other", trust_tier: "external" } });
+  const preTool = (tool, session = "sess-1") => run(["hook", "pre-tool-use"], { stdin: JSON.stringify({ session_id: session, hook_event_name: "PreToolUse", tool_name: tool, tool_input: {} }) });
+
+  test("pre-tool-use asks before risky tools only once external content is in the session", async () => {
+    assert.equal((await preTool("Bash")).stdout, "", "clean session: no opinion");
+    inboxReply = { messages: [msg("r_a", 1)], cursor: encodeCursor({ r_a: 1 }), more: false };
+    await run(["hook", "session-start"], { stdin: hookInput() });
+    assert.equal((await preTool("Bash")).stdout, "", "same_owner content doesn't taint");
+
+    inboxReply = { messages: [external("r_a", 2)], cursor: encodeCursor({ r_a: 2 }), more: false };
+    await run(["hook", "stop"], { stdin: hookInput() });
+    const ask = JSON.parse((await preTool("Bash")).stdout);
+    assert.equal(ask.hookSpecificOutput.permissionDecision, "ask");
+    assert.match(ask.hookSpecificOutput.permissionDecisionReason, /external agent/);
+    assert.equal((await preTool("Read")).stdout, "", "read-only tools are fine");
+    assert.equal((await preTool("Bash", "sess-other")).stdout, "", "taint is per session");
+  });
+
+  test("forwarded content (origin: external) taints too; policy.json can deny", async () => {
+    writeFileSync(join(home, "policy.json"), JSON.stringify({ external: { ask: ["Edit"], deny: ["Bash", "mcp__*"] } }));
+    inboxReply = { messages: [msg("r_a", 1, { meta: { origin: "external", reply_requested: true } })], cursor: encodeCursor({ r_a: 1 }), more: false };
+    await run(["hook", "session-start"], { stdin: hookInput() });
+    assert.equal(JSON.parse((await preTool("Bash")).stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(JSON.parse((await preTool("mcp__github__push")).stdout).hookSpecificOutput.permissionDecision, "deny");
+    assert.equal(JSON.parse((await preTool("Edit")).stdout).hookSpecificOutput.permissionDecision, "ask");
+    assert.equal((await preTool("Write")).stdout, "");
+  });
+
+  test("DM requests reach the context as pointers, and a new one ends the turn once", async () => {
+    const approval = { id: "apr_1", direction: "incoming", status: "pending", peer: { agent_id: "agt_x", owner_id: "github:other" }, room: null, approval_url: "https://lichen.test/approvals#apr_1" };
+    inboxReply = { messages: [], cursor: encodeCursor({}), more: false, approvals: [approval] };
+    const start = JSON.parse((await run(["hook", "session-start"], { stdin: hookInput() })).stdout);
+    assert.match(start.hookSpecificOutput.additionalContext, /`agt_x` \(owner `github:other`\) asked to DM you\. Only your user can decide/);
+    assert.equal((await run(["hook", "stop"], { stdin: hookInput() })).stdout, "", "already shown");
+
+    inboxReply = { ...inboxReply, approvals: [{ ...approval, id: "apr_2", direction: "outgoing", status: "allowed", room: "r_dm" }] };
+    const stop = JSON.parse((await run(["hook", "stop"], { stdin: hookInput() })).stdout);
+    assert.equal(stop.decision, "block");
+    assert.match(stop.reason, /was allowed — room `r_dm`/);
+    assert.equal((await run(["hook", "stop"], { stdin: hookInput() })).stdout, "");
+  });
+
   test("hook state is private", async () => {
     inboxReply = { messages: [msg("r_a", 1)], cursor: encodeCursor({ r_a: 1 }), more: false };
     await run(["hook", "stop"], { stdin: hookInput() });
@@ -265,6 +336,15 @@ describe("lib", () => {
     assert.match(text, /1 not shown/);
     // r_a was cut short at seq 1; r_b was shown in full, so it takes the server's cursor.
     assert.deepEqual(decodeCursor(cursorFor(inbox, shown, encodeCursor({ r_c: 3 }))), { r_a: 1, r_b: 7, r_c: 3 });
+  });
+
+  test("parseNotice passes approval events through, trimmed", () => {
+    assert.deepEqual(parseNotice('{"kind":"approval","id":"apr_1","status":"allowed","room":"r_dm","extra":"x"}'),
+      { kind: "approval", id: "apr_1", status: "allowed", room: "r_dm" });
+  });
+
+  test("preToolUseHook returns nothing for an unknown session", () => {
+    assert.equal(preToolUseHook({ session_id: "nope", tool_name: "Bash" }, { LICHEN_HOME: home }), null);
   });
 
   test("parseNotice keeps only notice fields", () => {
