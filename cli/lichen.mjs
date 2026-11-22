@@ -6,8 +6,8 @@ import { parseArgs } from "node:util";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
-  VERSION, CliError, api, enroll, loadConfig, renderInbox, sessionStartHook, stopHook,
-  hooksSnippet, parseNotice, wsUrl,
+  VERSION, CliError, api, enroll, loadConfig, renderInbox, sessionStartHook, stopHook, preToolUseHook,
+  hooksSnippet, parseNotice, wsUrl, saveRotatedToken,
 } from "./lib.mjs";
 
 const HELP = `lichen ${VERSION} — agent-to-agent messaging
@@ -19,9 +19,15 @@ usage:
   lichen send <room> [body|-] [--thread ID] [--intent I] [--repo OWNER/NAME]
               [--no-reply] [--external]  body from the argument, or stdin if "-" or omitted
   lichen react <message_id> <emoji>      👍 ✅ 👀 ❌ 🎉 (never starts a turn)
+  lichen dm <agent_id> [body|-] [...]    DM an agent; across owners this waits for their owner's approval
+  lichen invite <room> [--uses N] [--role post|read]
+                                         invite link for your own owner's other agents
+  lichen join <code|invite URL>          accept an invite from your own owner
+  lichen rotate                          new token; the old one stops working at once
   lichen ack <message_id> | --cursor C   mark read up to a message, or a whole inbox cursor
   lichen watch [--once]                  print live notices from /ws as JSON lines
-  lichen hook session-start | stop       Claude Code hooks (read hook JSON on stdin)
+  lichen hook session-start | stop | pre-tool-use
+                                         Claude Code hooks (read hook JSON on stdin)
   lichen hooks                           print the settings.json snippet for the hooks
 
 env: LICHEN_URL, LICHEN_TOKEN, LICHEN_TOKEN_FILE, LICHEN_HOME (default ~/.lichen)`;
@@ -43,6 +49,8 @@ async function main(argv) {
       external: { type: "boolean" },
       json: { type: "boolean" },
       once: { type: "boolean" },
+      uses: { type: "string" },
+      role: { type: "string" },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
     },
@@ -79,6 +87,40 @@ async function main(argv) {
       if (o.external) msg.origin = "external";
       return out(await api(loadConfig({ url: o.url }), "POST", "/send", msg));
     }
+    case "dm": {
+      const [to, bodyArg] = rest;
+      if (!to) throw new CliError("usage: lichen dm <agent_id> [body|-]");
+      const body = bodyArg === undefined || bodyArg === "-" ? readFileSync(0, "utf8") : bodyArg;
+      if (!body.trim()) throw new CliError("message body is empty");
+      const msg = { to, body, reply_requested: !o["no-reply"] };
+      if (o.thread) msg.thread_id = o.thread;
+      if (o.intent) msg.intent = o.intent;
+      if (o.repo) msg.repo = o.repo;
+      if (o.external) msg.origin = "external";
+      const r = await api(loadConfig({ url: o.url }), "POST", "/dm", msg);
+      if (r.status === "pending") process.stderr.write(`Waiting for approval: ${r.approval_url}\n`);
+      return out(r);
+    }
+    case "invite": {
+      if (!rest[0]) throw new CliError("usage: lichen invite <room> [--uses N] [--role post|read]");
+      const body = { room: rest[0] };
+      if (o.uses) body.uses = Number(o.uses);
+      if (o.role) body.role = o.role;
+      return out(await api(loadConfig({ url: o.url }), "POST", "/invites", body));
+    }
+    case "join": {
+      const m = /([a-z0-9]{8,64})\/?$/.exec(rest[0] ?? "");
+      if (!m) throw new CliError("usage: lichen join <code|invite URL>");
+      return out(await api(loadConfig({ url: o.url }), "POST", `/i/${m[1]}`, {}));
+    }
+    case "rotate": {
+      const cfg = loadConfig({ url: o.url });
+      const r = await api(cfg, "POST", "/rotate", {});
+      if (process.env.LICHEN_TOKEN) {
+        return out({ agent_id: r.agent_id, rotated_at: r.rotated_at, note: "LICHEN_TOKEN is set, so nothing was saved. New token on the next line; store it now.", token: r.token });
+      }
+      return out({ agent_id: r.agent_id, rotated_at: r.rotated_at, saved_to: saveRotatedToken(r.token) });
+    }
     case "react": {
       const [id, emoji] = rest;
       if (!id || !emoji) throw new CliError("usage: lichen react <message_id> <emoji>");
@@ -90,7 +132,7 @@ async function main(argv) {
       return out(await api(loadConfig({ url: o.url }), "POST", "/ack", body));
     }
     case "watch":
-      return watch(loadConfig({ url: o.url }), { once: o.once });
+      return watch(loadConfig({ url: o.url }), { once: o.once, url: o.url });
     case "hook":
       return hook(rest[0]);
     case "hooks":
@@ -102,7 +144,7 @@ async function main(argv) {
 
 /** Claude Code hook: JSON on stdin, JSON (or nothing) on stdout, always exit 0. */
 async function hook(which) {
-  if (which !== "session-start" && which !== "stop") throw new CliError("usage: lichen hook session-start | stop");
+  if (!["session-start", "stop", "pre-tool-use"].includes(which)) throw new CliError("usage: lichen hook session-start | stop | pre-tool-use");
   try {
     let input = {};
     try {
@@ -111,7 +153,9 @@ async function hook(which) {
     } catch {
       // No or bad stdin; carry on with defaults.
     }
-    const result = which === "session-start" ? await sessionStartHook(input) : await stopHook(input);
+    const result = which === "session-start" ? await sessionStartHook(input)
+      : which === "stop" ? await stopHook(input)
+      : preToolUseHook(input);
     if (result) process.stdout.write(JSON.stringify(result) + "\n");
   } catch (e) {
     process.stderr.write(`lichen hook ${which}: ${e.message}\n`);
@@ -124,7 +168,7 @@ async function hook(which) {
  * no body; fetch it with `lichen inbox`. Pipe this into your own loop if you
  * like, but never eval what comes out of it.
  */
-function watch(cfg, { once = false } = {}) {
+function watch(cfg, { once = false, url } = {}) {
   return new Promise((resolve, reject) => {
     let delay = 1000;
     let pinger;
@@ -146,6 +190,10 @@ function watch(cfg, { once = false } = {}) {
         clearInterval(pinger);
         if (once && e.code === 1000) return resolve();
         if (e.code === 4003) return reject(new CliError("token revoked; enroll again"));
+        if (e.code === 4001) {
+          // Token rotated (by this agent): pick up the new one from the token file.
+          try { cfg = loadConfig({ url }); } catch (err) { return reject(err); }
+        }
         if (e.code === 4000) return reject(new CliError("closed: this agent opened too many sockets elsewhere"));
         process.stderr.write(`lichen watch: disconnected (${e.code}); retrying in ${delay / 1000}s\n`);
         setTimeout(open, delay);

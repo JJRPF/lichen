@@ -6,10 +6,11 @@
 // (sender_id, sender_owner_id) is supplied by the Worker, never by clients.
 //
 // After each append it tells every other member's AgentSocket DO, which pushes
-// a short notice ({id, room, from, trust_tier}) to that agent's open sockets.
+// a short notice ({id, room, from, trust_tier}) to that agent's open sockets,
+// and each member's owner's dashboard socket.
 
 import { DurableObject } from "cloudflare:workers";
-import { tierFor, type Env, type Notice, type Recipient } from "./env";
+import { ownerHubName, tierFor, type Env, type Notice, type Recipient } from "./env";
 
 export interface Envelope {
   sender_id: string;
@@ -45,6 +46,8 @@ export interface Limits {
 export interface Fanout {
   roomId: string;
   recipients: Recipient[];
+  /** Owners of every member, sender's included, for the live dashboard. */
+  owners?: string[];
 }
 
 export type AppendResult =
@@ -149,9 +152,16 @@ export class Room extends DurableObject<Env> {
    * a failed notice is harmless because /inbox is the source of truth.
    */
   private fanOut(from: Envelope, seq: number, noTurn: boolean, fanout?: Fanout) {
-    if (!fanout?.recipients.length) return;
-    const { roomId, recipients } = fanout;
-    const work = Promise.allSettled(recipients
+    if (!fanout) return;
+    const { roomId, recipients, owners = [] } = fanout;
+    const toOwners = [...new Set(owners)].map((o) => {
+      const n: Notice = {
+        id: `${roomId}:${seq}`, room: roomId, from: from.sender_id, trust_tier: tierFor(o, from.sender_owner_id),
+        ...(noTurn ? { no_turn: true as const } : {}),
+      };
+      return this.env.AGENT.get(this.env.AGENT.idFromName(ownerHubName(o))).notify(n);
+    });
+    const work = Promise.allSettled([...toOwners, ...recipients
       .filter((r) => r.agent_id !== from.sender_id)
       .map((r) => {
         const notice: Notice = {
@@ -162,7 +172,7 @@ export class Room extends DurableObject<Env> {
           ...(noTurn ? { no_turn: true as const } : {}),
         };
         return this.env.AGENT.get(this.env.AGENT.idFromName(r.agent_id)).notify(notice);
-      }));
+      })]);
     this.ctx.waitUntil(work);
   }
 

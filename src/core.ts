@@ -1,0 +1,277 @@
+// Shared pieces of the Worker: auth, membership, sending, owner notices.
+
+import type { Envelope, Fanout, MessageMeta, StoredMessage } from "./room";
+import { ownerHubName, tierFor, type Env, type LiveEvent, type TrustTier } from "./env";
+import { HttpError, randomString, safeEqual, sha256Hex, str, bool } from "./util";
+
+const ENROLL_CODE_TTL_S = 24 * 60 * 60;
+
+/** Per-request context. */
+export interface Ctx {
+  env: Env;
+  origin: string;
+  waitUntil(p: Promise<unknown>): void;
+}
+
+export interface Agent {
+  id: string;
+  owner_id: string;
+  name: string;
+}
+
+export const REACTIONS = new Set(["👍", "✅", "👀", "❌", "🎉"]);
+export const PAGE_LIMIT = 50;
+
+// ---------------------------------------------------------------- auth
+
+export function bearer(req: Request): string | null {
+  const h = req.headers.get("authorization") ?? "";
+  const m = /^Bearer\s+(\S+)$/i.exec(h);
+  return m ? m[1] : null;
+}
+
+export async function rateLimit(env: Env, key: string): Promise<void> {
+  if (!env.RATE_LIMITER) return;
+  const { success } = await env.RATE_LIMITER.limit({ key });
+  if (!success) throw new HttpError(429, "rate_limited", "Too many requests; slow down");
+}
+
+export async function authAgent(req: Request, env: Env): Promise<Agent> {
+  const token = bearer(req);
+  if (!token) throw new HttpError(401, "unauthorized", "Missing bearer token");
+  const hash = await sha256Hex(token);
+  // Rate-limit by token hash before touching D1, so a bad token is cheap too.
+  await rateLimit(env, `tok:${hash}`);
+  const agent = await env.DB.prepare(
+    "SELECT id, owner_id, name FROM agents WHERE token_hash = ? AND status = 'active'",
+  ).bind(hash).first<Agent>();
+  if (!agent) throw new HttpError(401, "unauthorized", "Unknown or revoked token");
+  return agent;
+}
+
+export function isAdmin(req: Request, env: Env): boolean {
+  const token = bearer(req);
+  return Boolean(env.ADMIN_TOKEN && token && safeEqual(token, env.ADMIN_TOKEN));
+}
+
+/** Operator token (stand-in for an operator role; owners use Cloudflare Access). */
+export function requireAdmin(req: Request, env: Env): void {
+  if (!isAdmin(req, env)) throw new HttpError(401, "unauthorized", "Admin token required");
+}
+
+export async function audit(env: Env, actor: string, action: string, target: string | null, detail?: object) {
+  await env.DB.prepare("INSERT INTO audit (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)")
+    .bind(Date.now(), actor, action, target, detail ? JSON.stringify(detail) : null).run();
+}
+
+// ---------------------------------------------------------------- rooms
+
+export const room = (env: Env, roomId: string) => env.ROOM.get(env.ROOM.idFromName(roomId));
+export const agentHub = (env: Env, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentId));
+export const ownerHub = (env: Env, ownerId: string) => env.AGENT.get(env.AGENT.idFromName(ownerHubName(ownerId)));
+
+export interface MembershipRow { room_id: string; name: string; kind: string; role: string; last_read_seq: number }
+
+export async function memberships(env: Env, agentId: string): Promise<MembershipRow[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
+     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? ORDER BY r.created_at`,
+  ).bind(agentId).all<MembershipRow>();
+  return results;
+}
+
+export async function membership(env: Env, agentId: string, roomId: string): Promise<MembershipRow> {
+  const row = await env.DB.prepare(
+    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
+     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? AND m.room_id = ?`,
+  ).bind(agentId, roomId).first<MembershipRow>();
+  // Same answer for "no such room" and "not a member", so room ids can't be probed.
+  if (!row) throw new HttpError(404, "room_not_found");
+  return row;
+}
+
+interface MemberRow { agent_id: string; owner_id: string; role: string }
+
+/**
+ * Everyone who should hear about a new message in a room, in one D1 query,
+ * plus the sender's own row. Same 404 for "no such room" and "not a member".
+ */
+export async function postingMembership(env: Env, sender: Agent, roomId: string): Promise<Fanout> {
+  const { results } = await env.DB.prepare(
+    `SELECT m.agent_id, a.owner_id, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
+     WHERE m.room_id = ? AND a.status = 'active'`,
+  ).bind(roomId).all<MemberRow>();
+  const me = results.find((r) => r.agent_id === sender.id);
+  if (!me) throw new HttpError(404, "room_not_found");
+  if (me.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
+  return {
+    roomId,
+    recipients: results.filter((r) => r.agent_id !== sender.id).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
+    owners: [...new Set(results.map((r) => r.owner_id))],
+  };
+}
+
+/** Only these metadata keys are kept. Trust fields from clients are dropped. */
+export function cleanMeta(b: Record<string, unknown>): MessageMeta {
+  const origin = str(b.origin, "origin", 16);
+  if (origin !== undefined && origin !== "external") throw new HttpError(400, "invalid_field", "origin may only be 'external'");
+  const meta: MessageMeta = {
+    intent: str(b.intent, "intent", 64),
+    repo: str(b.repo, "repo", 200),
+    thread_id: str(b.thread_id, "thread_id", 128),
+    reply_requested: bool(b.reply_requested, "reply_requested", true),
+    origin: origin as "external" | undefined,
+  };
+  for (const k of Object.keys(meta) as (keyof MessageMeta)[]) if (meta[k] === undefined) delete meta[k];
+  return meta;
+}
+
+export function checkBodySize(env: Env, text: string) {
+  const maxBytes = Number(env.MAX_BODY_BYTES ?? 16384);
+  if (new TextEncoder().encode(text).byteLength > maxBytes) {
+    throw new HttpError(413, "body_too_large", `body must be at most ${maxBytes} bytes`);
+  }
+}
+
+export interface Sent { id: string; room: string; seq: number; created_at: number; thread_paused: boolean }
+
+/** Append a message as `sender` and notify the room. Membership must already be checked (fanout). */
+export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: string, meta: MessageMeta): Promise<Sent> {
+  const { env } = ctx;
+  const envelope: Envelope = { sender_id: sender.id, sender_owner_id: sender.owner_id };
+  const res = await room(env, fanout.roomId).sendMessage(envelope, text, meta, {
+    turnCap: Number(env.TURN_CAP ?? 10),
+    cooldownMs: Number(env.COOLDOWN_MS ?? 2000),
+  }, fanout);
+  if (!res.ok) {
+    if (res.error === "thread_paused") {
+      throw new HttpError(409, "thread_paused", "Turn cap reached; an owner must resume this thread");
+    }
+    const err = new HttpError(429, "cooldown", "Wait before posting again in this thread") as HttpError & { retryAfterMs?: number };
+    err.retryAfterMs = res.retry_after_ms;
+    throw err;
+  }
+  const id = `${fanout.roomId}:${res.seq}`;
+  await audit(env, sender.id, "send", id, { thread_id: meta.thread_id ?? null, bytes: text.length });
+  if (res.paused) {
+    // Turn cap reached: tell every owner in the room, on the dashboard.
+    for (const o of fanout.owners ?? [sender.owner_id]) {
+      await ownerNotice(ctx, o, "thread_paused", fanout.roomId, { thread_id: meta.thread_id ?? "" });
+    }
+  }
+  return { id, room: fanout.roomId, seq: res.seq, created_at: res.created_at, thread_paused: res.paused ?? false };
+}
+
+// ---------------------------------------------------------------- reading
+
+export function present(viewerOwner: string, roomId: string, m: StoredMessage) {
+  const trust_tier: TrustTier = tierFor(viewerOwner, m.sender_owner_id);
+  const envelope = { sender_id: m.sender_id, sender_owner_id: m.sender_owner_id, trust_tier };
+  const base = { id: `${roomId}:${m.seq}`, room: roomId, seq: m.seq, kind: m.kind, envelope, created_at: m.created_at };
+  if (m.kind === "reaction") {
+    return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
+  }
+  return { ...base, body: m.body, meta: m.meta, no_turn: false };
+}
+
+export async function readHistory(env: Env, viewerOwner: string, roomId: string, url: URL) {
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? PAGE_LIMIT) || PAGE_LIMIT, 1), 100);
+  const before = url.searchParams.get("before");
+  const after = url.searchParams.get("after");
+  const thread = url.searchParams.get("thread_id");
+  const msgs = await room(env, roomId).list({
+    afterSeq: after ? Number(after) : undefined,
+    beforeSeq: before ? Number(before) : after ? undefined : Number.MAX_SAFE_INTEGER,
+    threadId: thread ?? undefined,
+    limit,
+  });
+  return { room: roomId, messages: msgs.map((m) => present(viewerOwner, roomId, m)) };
+}
+
+// ---------------------------------------------------------------- owners
+
+export interface Owner { id: string; email: string | null; ntfy_topic: string | null }
+
+export const newNtfyTopic = () => `lichen-${randomString(24)}`;
+
+const NOTICE_TEXT: Record<string, string> = {
+  approval_pending: "Lichen: 1 pending request",
+  invite_joined: "Lichen: someone joined",
+  thread_paused: "Lichen: a thread is paused",
+};
+
+/**
+ * Record a dashboard notice, push a pointer to the owner's open dashboards,
+ * and send an ntfy push. Pushes say *that* something is waiting and *where*,
+ * never *what*: ntfy topics can be read by anyone who guesses the name.
+ */
+export async function ownerNotice(ctx: Ctx, ownerId: string, kind: string, target: string | null, detail?: object) {
+  const { env } = ctx;
+  const row = await env.DB.prepare(
+    "INSERT INTO notices (owner_id, kind, target, detail, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+  ).bind(ownerId, kind, target, detail ? JSON.stringify(detail) : null, Date.now()).first<{ id: number }>();
+  const event: LiveEvent = { kind: "notice", notice: kind, id: row?.id ?? 0 };
+  ctx.waitUntil(ownerHub(env, ownerId).notify(event).catch(() => 0));
+
+  const base = env.NTFY_BASE ?? "https://ntfy.sh";
+  if (!base) return;
+  const owner = await env.DB.prepare("SELECT ntfy_topic FROM owners WHERE id = ?").bind(ownerId).first<{ ntfy_topic: string | null }>();
+  if (!owner?.ntfy_topic) return;
+  const click = `${ctx.origin}${kind === "approval_pending" ? "/approvals" : "/dashboard"}`;
+  ctx.waitUntil(fetch(`${base.replace(/\/+$/, "")}/${owner.ntfy_topic}`, {
+    method: "POST",
+    headers: { Title: "Lichen", Click: click, Tags: "bell" },
+    body: NOTICE_TEXT[kind] ?? "Lichen: 1 new notice",
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => undefined));
+}
+
+/** Rooms (and their members) that any of this owner's agents belong to. */
+export async function ownerRoomIds(env: Env, ownerId: string): Promise<string[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT DISTINCT m.room_id FROM memberships m JOIN agents a ON a.id = m.agent_id WHERE a.owner_id = ?`,
+  ).bind(ownerId).all<{ room_id: string }>();
+  return results.map((r) => r.room_id);
+}
+
+export async function ownerCanSeeRoom(env: Env, ownerId: string, roomId: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    `SELECT 1 AS ok FROM memberships m JOIN agents a ON a.id = m.agent_id WHERE m.room_id = ? AND a.owner_id = ? LIMIT 1`,
+  ).bind(roomId, ownerId).first();
+  return Boolean(row);
+}
+
+// ---------------------------------------------------------------- enroll codes / sockets
+
+/** One-time enroll code for a new agent of `ownerId` (same_owner by construction). */
+export async function mintEnrollCode(env: Env, actor: string, ownerId: string, agentName: string, ttlRaw: unknown) {
+  const now = Date.now();
+  const ttl = Math.min(Number(ttlRaw ?? ENROLL_CODE_TTL_S) || ENROLL_CODE_TTL_S, 7 * 24 * 3600);
+  const code = randomString(12);
+  const expires = now + ttl * 1000;
+  await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO owners (id, created_at) VALUES (?, ?)").bind(ownerId, now),
+    env.DB.prepare("INSERT INTO enroll_codes (code_hash, owner_id, agent_name, expires_at) VALUES (?, ?, ?, ?)")
+      .bind(await sha256Hex(code), ownerId, agentName, expires),
+  ]);
+  await audit(env, actor, "enroll_code.create", ownerId, { agent_name: agentName });
+  return { code, owner_id: ownerId, agent_name: agentName, expires_at: expires };
+}
+
+/**
+ * GET /ws (WebSocket upgrade). The token is checked before this; the upgrade
+ * is handed to the AgentSocket DO named `hubName`. The socket only carries
+ * notices ({id, room, from, trust_tier}, plus no_turn for reactions) and
+ * approval events; bodies are read from /inbox.
+ */
+export async function connect(req: Request, env: Env, hubName: string): Promise<Response> {
+  if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    throw new HttpError(426, "upgrade_required", "Connect with a WebSocket client");
+  }
+  const headers = new Headers(req.headers);
+  headers.delete("authorization"); // the DO doesn't need credentials
+  headers.delete("cookie");
+  headers.delete("cf-access-jwt-assertion");
+  return env.AGENT.get(env.AGENT.idFromName(hubName)).fetch(new Request("https://agent.internal/ws", { headers }));
+}
+

@@ -1,109 +1,91 @@
 // Lichen — agent-to-agent messaging on Cloudflare's free plan.
 // Phase 1: enroll, rooms, send, react, inbox, history, ack.
 // Phase 2: /ws live notices (one AgentSocket DO per agent, hibernating sockets).
+// Phase 3: owners (Cloudflare Access), invites, DM requests.
+// Phase 4: dashboard, approvals, ntfy. Phase 5: token rotation.
 //
-// Every response is JSON data. Nothing the server returns is meant to be executed.
+// Every response is JSON data (or, for browsers, an HTML page). Nothing the
+// server returns is meant to be executed.
 
-import { Room, type Envelope, type Fanout, type MessageMeta, type StoredMessage } from "./room";
-import { AgentSocket } from "./agent";
-import { VERSION, tierFor, type Env, type TrustTier } from "./env";
+import { Room } from "./room";
+import { AgentSocket, CLOSE_ROTATED } from "./agent";
+import { VERSION, type Env } from "./env";
 import {
-  HttpError, json, errorResponse, newId, newToken, randomString, sha256Hex, safeEqual,
-  readBody, str, bool, encodeCursor, decodeCursor, parseMessageId, type Cursor,
+  type Agent, type Ctx, PAGE_LIMIT, REACTIONS, agentHub, audit, authAgent, cleanMeta, checkBodySize, connect, memberships,
+  membership, mintEnrollCode, newNtfyTopic, postingMembership, present, rateLimit, readHistory, requireAdmin, room, sendInto,
+} from "./core";
+import {
+  acceptInvite, agentApprovals, createInvite, createRoom, joinOnEnroll, lookupInvite, publicInvite, requestDm,
+} from "./social";
+import { ownerRoute } from "./owner";
+import { invitePage, wantsHtml } from "./pages";
+import {
+  HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, encodeCursor, decodeCursor,
+  parseMessageId, type Cursor,
 } from "./util";
 
 export { Room, AgentSocket };
 export type { Env };
 
-interface Agent {
-  id: string;
-  owner_id: string;
-  name: string;
-}
-
-const REACTIONS = new Set(["👍", "✅", "👀", "❌", "🎉"]);
-const ENROLL_CODE_TTL_S = 24 * 60 * 60;
-const PAGE_LIMIT = 50;
-
 export default {
-  async fetch(req: Request, env: Env): Promise<Response> {
+  async fetch(req: Request, env: Env, ectx: ExecutionContext): Promise<Response> {
+    const ctx: Ctx = { env, origin: new URL(req.url).origin, waitUntil: (p) => ectx.waitUntil(p) };
     try {
-      return await route(req, env);
+      return await route(req, ctx);
     } catch (err) {
+      const e = err as HttpError & { retryAfterMs?: number };
+      if (e instanceof HttpError && e.code === "cooldown") {
+        const ms = e.retryAfterMs ?? 1000;
+        return json({ error: "cooldown", retry_after_ms: ms }, 429, { "retry-after": String(Math.ceil(ms / 1000)) });
+      }
       return errorResponse(err);
     }
   },
 } satisfies ExportedHandler<Env>;
 
-async function route(req: Request, env: Env): Promise<Response> {
+async function route(req: Request, ctx: Ctx): Promise<Response> {
+  const { env } = ctx;
   const url = new URL(req.url);
   const p = url.pathname.replace(/\/+$/, "") || "/";
   const m = req.method;
 
   if (p === "/" && m === "GET") return json({ service: "lichen", version: VERSION });
-  if (p === "/enroll" && m === "POST") return enroll(req, env);
+  if (p === "/enroll" && m === "POST") return enroll(req, ctx);
+
+  const inv = /^\/i\/([A-Za-z0-9]+)$/.exec(p);
+  if (inv) return invite(req, ctx, inv[1], m);
 
   if (p.startsWith("/admin/")) {
     requireAdmin(req, env);
-    return admin(req, env, p, m);
+    return admin(req, ctx, p, m);
   }
+
+  const owner = await ownerRoute(req, ctx, p, m, url);
+  if (owner) return owner;
 
   const agent = await authAgent(req, env);
   if (p === "/rooms" && m === "GET") return listRooms(env, agent);
-  if (p === "/send" && m === "POST") return send(req, env, agent);
-  if (p === "/react" && m === "POST") return react(req, env, agent);
-  if (p === "/inbox" && m === "GET") return inbox(url, env, agent);
+  if (p === "/send" && m === "POST") return send(req, ctx, agent);
+  if (p === "/react" && m === "POST") return react(req, ctx, agent);
+  if (p === "/dm" && m === "POST") {
+    const r = await requestDm(ctx, agent, await readBody(req));
+    return json(r.body, r.status);
+  }
+  if (p === "/invites" && m === "POST") return json(await createInvite(ctx, { owner: agent.owner_id, agent }, await readBody(req)), 201);
+  if (p === "/inbox" && m === "GET") return inbox(url, ctx, agent);
   if (p === "/history" && m === "GET") return history(url, env, agent);
   if (p === "/ack" && m === "POST") return ack(req, env, agent);
-  if (p === "/ws" && m === "GET") return connect(req, env, agent);
+  if (p === "/ws" && m === "GET") return connect(req, env, agent.id);
+  if (p === "/rotate" && m === "POST") return rotate(env, agent);
   if (p === "/me" && m === "GET") return json({ agent_id: agent.id, owner_id: agent.owner_id, name: agent.name });
 
   throw new HttpError(404, "not_found");
 }
 
-// ---------------------------------------------------------------- auth
+// ---------------------------------------------------------------- enroll / rotate
 
-function bearer(req: Request): string | null {
-  const h = req.headers.get("authorization") ?? "";
-  const m = /^Bearer\s+(\S+)$/i.exec(h);
-  return m ? m[1] : null;
-}
-
-async function rateLimit(env: Env, key: string): Promise<void> {
-  if (!env.RATE_LIMITER) return;
-  const { success } = await env.RATE_LIMITER.limit({ key });
-  if (!success) throw new HttpError(429, "rate_limited", "Too many requests; slow down");
-}
-
-async function authAgent(req: Request, env: Env): Promise<Agent> {
-  const token = bearer(req);
-  if (!token) throw new HttpError(401, "unauthorized", "Missing bearer token");
-  const hash = await sha256Hex(token);
-  // Rate-limit by token hash before touching D1, so a bad token is cheap too.
-  await rateLimit(env, `tok:${hash}`);
-  const agent = await env.DB.prepare(
-    "SELECT id, owner_id, name FROM agents WHERE token_hash = ? AND status = 'active'",
-  ).bind(hash).first<Agent>();
-  if (!agent) throw new HttpError(401, "unauthorized", "Unknown or revoked token");
-  return agent;
-}
-
-/** Phase-1 stand-in for Cloudflare Access: a single admin bearer token. */
-function requireAdmin(req: Request, env: Env): void {
-  const token = bearer(req);
-  if (!env.ADMIN_TOKEN || !token || !safeEqual(token, env.ADMIN_TOKEN)) {
-    throw new HttpError(401, "unauthorized", "Admin token required");
-  }
-}
-
-async function audit(env: Env, actor: string, action: string, target: string | null, detail?: object) {
-  await env.DB.prepare("INSERT INTO audit (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)")
-    .bind(Date.now(), actor, action, target, detail ? JSON.stringify(detail) : null).run();
-}
-
-// ---------------------------------------------------------------- enroll
-
-async function enroll(req: Request, env: Env): Promise<Response> {
+async function enroll(req: Request, ctx: Ctx): Promise<Response> {
+  const { env } = ctx;
   await rateLimit(env, `enroll:${req.headers.get("cf-connecting-ip") ?? "unknown"}`);
   const body = await readBody(req);
   const code = str(body.code, "code", 64, true)!.trim().toLowerCase();
@@ -111,8 +93,11 @@ async function enroll(req: Request, env: Env): Promise<Response> {
   const now = Date.now();
 
   const row = await env.DB.prepare(
-    "SELECT owner_id, agent_name, expires_at, used_at FROM enroll_codes WHERE code_hash = ?",
-  ).bind(codeHash).first<{ owner_id: string; agent_name: string; expires_at: number; used_at: number | null }>();
+    "SELECT owner_id, agent_name, expires_at, used_at, room_id, role, invite_id FROM enroll_codes WHERE code_hash = ?",
+  ).bind(codeHash).first<{
+    owner_id: string; agent_name: string; expires_at: number; used_at: number | null;
+    room_id: string | null; role: "post" | "read" | null; invite_id: string | null;
+  }>();
   if (!row || row.used_at || row.expires_at < now) throw new HttpError(401, "invalid_code", "Code is unknown, used or expired");
 
   const agentId = newId("agt");
@@ -129,118 +114,71 @@ async function enroll(req: Request, env: Env): Promise<Response> {
   if (results[1].meta.changes !== 1) throw new HttpError(401, "invalid_code", "Code is unknown, used or expired");
 
   await audit(env, agentId, "enroll", row.owner_id);
-  const base = new URL(req.url).origin;
-  return json({ agent_id: agentId, owner_id: row.owner_id, name: row.agent_name, token, base_url: base }, 201);
+  const agent: Agent = { id: agentId, owner_id: row.owner_id, name: row.agent_name };
+  if (row.room_id) await joinOnEnroll(ctx, agent, row.room_id, row.role ?? "post", row.invite_id);
+  return json({
+    agent_id: agentId, owner_id: row.owner_id, name: row.agent_name, token, base_url: ctx.origin,
+    ...(row.room_id ? { joined_room: row.room_id } : {}),
+  }, 201);
 }
 
-// ---------------------------------------------------------------- rooms
-
-interface MembershipRow { room_id: string; name: string; kind: string; role: string; last_read_seq: number }
-
-async function memberships(env: Env, agentId: string): Promise<MembershipRow[]> {
-  const { results } = await env.DB.prepare(
-    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
-     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? ORDER BY r.created_at`,
-  ).bind(agentId).all<MembershipRow>();
-  return results;
+/** Swap this agent's token for a new one. The old token stops working at once. */
+async function rotate(env: Env, agent: Agent): Promise<Response> {
+  const token = newToken();
+  const now = Date.now();
+  const res = await env.DB.prepare("UPDATE agents SET token_hash = ?, rotated_at = ? WHERE id = ? AND status = 'active'")
+    .bind(await sha256Hex(token), now, agent.id).run();
+  if (!res.meta.changes) throw new HttpError(401, "unauthorized");
+  // Sockets opened with the old token are closed too.
+  await agentHub(env, agent.id).closeAll(CLOSE_ROTATED, "token rotated");
+  await audit(env, agent.id, "token.rotate", agent.id);
+  return json({ agent_id: agent.id, token, rotated_at: now });
 }
 
-async function membership(env: Env, agentId: string, roomId: string): Promise<MembershipRow> {
-  const row = await env.DB.prepare(
-    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
-     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? AND m.room_id = ?`,
-  ).bind(agentId, roomId).first<MembershipRow>();
-  // Same answer for "no such room" and "not a member", so room ids can't be probed.
-  if (!row) throw new HttpError(404, "room_not_found");
-  return row;
-}
+// ---------------------------------------------------------------- rooms / send / react
 
 async function listRooms(env: Env, agent: Agent): Promise<Response> {
   const rows = await memberships(env, agent.id);
+  const ids = rows.map((r) => r.room_id);
+  const members = new Map<string, { agent_id: string; owner_id: string; name: string; role: string }[]>();
+  if (ids.length) {
+    const { results } = await env.DB.prepare(
+      `SELECT m.room_id, m.agent_id, a.owner_id, a.name, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
+       WHERE a.status = 'active' AND m.room_id IN (${ids.map(() => "?").join(",")})`,
+    ).bind(...ids).all<{ room_id: string; agent_id: string; owner_id: string; name: string; role: string }>();
+    for (const r of results) {
+      const list = members.get(r.room_id) ?? [];
+      list.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.name, role: r.role });
+      members.set(r.room_id, list);
+    }
+  }
   return json({
-    rooms: rows.map((r) => ({ id: r.room_id, name: r.name, kind: r.kind, role: r.role, last_read_seq: r.last_read_seq })),
+    rooms: rows.map((r) => ({
+      id: r.room_id, name: r.name, kind: r.kind, role: r.role, last_read_seq: r.last_read_seq,
+      members: members.get(r.room_id) ?? [],
+    })),
   });
 }
 
-const room = (env: Env, roomId: string) => env.ROOM.get(env.ROOM.idFromName(roomId));
-const agentHub = (env: Env, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentId));
-
-interface MemberRow { agent_id: string; owner_id: string; role: string }
-
-/**
- * The caller's membership plus everyone else who should get a live notice,
- * in one D1 query. Same 404 for "no such room" and "not a member".
- */
-async function postingMembership(env: Env, agent: Agent, roomId: string): Promise<Fanout> {
-  const { results } = await env.DB.prepare(
-    `SELECT m.agent_id, a.owner_id, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
-     WHERE m.room_id = ? AND a.status = 'active'`,
-  ).bind(roomId).all<MemberRow>();
-  const me = results.find((r) => r.agent_id === agent.id);
-  if (!me) throw new HttpError(404, "room_not_found");
-  if (me.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
-  return {
-    roomId,
-    recipients: results.filter((r) => r.agent_id !== agent.id).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
-  };
-}
-
-// ---------------------------------------------------------------- send / react
-
-/** Only these metadata keys are kept. Trust fields from clients are dropped. */
-function cleanMeta(b: Record<string, unknown>): MessageMeta {
-  const origin = str(b.origin, "origin", 16);
-  if (origin !== undefined && origin !== "external") throw new HttpError(400, "invalid_field", "origin may only be 'external'");
-  const meta: MessageMeta = {
-    intent: str(b.intent, "intent", 64),
-    repo: str(b.repo, "repo", 200),
-    thread_id: str(b.thread_id, "thread_id", 128),
-    reply_requested: bool(b.reply_requested, "reply_requested", true),
-    origin: origin as "external" | undefined,
-  };
-  for (const k of Object.keys(meta) as (keyof MessageMeta)[]) if (meta[k] === undefined) delete meta[k];
-  return meta;
-}
-
-async function send(req: Request, env: Env, agent: Agent): Promise<Response> {
+async function send(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
   const b = await readBody(req);
   const roomId = str(b.room, "room", 64, true)!;
   const text = str(b.body, "body", 1_000_000, true)!;
-  const maxBytes = Number(env.MAX_BODY_BYTES ?? 16384);
-  if (new TextEncoder().encode(text).byteLength > maxBytes) {
-    throw new HttpError(413, "body_too_large", `body must be at most ${maxBytes} bytes`);
-  }
+  checkBodySize(ctx.env, text);
   // Allow metadata either flat or nested under "meta".
   const meta = cleanMeta(b.meta && typeof b.meta === "object" ? { ...(b.meta as object) } as Record<string, unknown> : b);
-
-  const fanout = await postingMembership(env, agent, roomId);
-
-  const envelope: Envelope = { sender_id: agent.id, sender_owner_id: agent.owner_id };
-  const res = await room(env, roomId).sendMessage(envelope, text, meta, {
-    turnCap: Number(env.TURN_CAP ?? 10),
-    cooldownMs: Number(env.COOLDOWN_MS ?? 2000),
-  }, fanout);
-  if (!res.ok) {
-    if (res.error === "thread_paused") {
-      throw new HttpError(409, "thread_paused", "Turn cap reached; an owner must resume this thread");
-    }
-    const retry = Math.ceil((res.retry_after_ms ?? 1000) / 1000);
-    return json({ error: "cooldown", retry_after_ms: res.retry_after_ms }, 429, { "retry-after": String(retry) });
-  }
-
-  const id = `${roomId}:${res.seq}`;
-  await audit(env, agent.id, "send", id, { thread_id: meta.thread_id ?? null, bytes: text.length });
-  return json({ id, room: roomId, seq: res.seq, created_at: res.created_at, thread_paused: res.paused ?? false }, 201);
+  const fanout = await postingMembership(ctx.env, agent, roomId);
+  return json(await sendInto(ctx, agent, fanout, text, meta), 201);
 }
 
-async function react(req: Request, env: Env, agent: Agent): Promise<Response> {
+async function react(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
+  const { env } = ctx;
   const b = await readBody(req);
   const { roomId, seq } = parseMessageId(str(b.message_id, "message_id", 100, true)!);
   const emoji = str(b.emoji, "emoji", 16, true)!;
   if (!REACTIONS.has(emoji)) throw new HttpError(400, "invalid_emoji", `emoji must be one of ${[...REACTIONS].join(" ")}`);
 
   const fanout = await postingMembership(env, agent, roomId);
-
   const res = await room(env, roomId).react({ sender_id: agent.id, sender_owner_id: agent.owner_id }, seq, emoji, fanout);
   if (!res.ok) throw new HttpError(404, "message_not_found");
   const id = `${roomId}:${res.seq}`;
@@ -250,38 +188,10 @@ async function react(req: Request, env: Env, agent: Agent): Promise<Response> {
 
 // ---------------------------------------------------------------- live notices
 
-/**
- * GET /ws (WebSocket upgrade). The token is checked here, then the upgrade is
- * handed to this agent's AgentSocket DO. The socket only ever carries notices
- * ({id, room, from, trust_tier}, plus no_turn for reactions); bodies are read
- * from /inbox.
- */
-async function connect(req: Request, env: Env, agent: Agent): Promise<Response> {
-  if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-    throw new HttpError(426, "upgrade_required", "Connect with a WebSocket client");
-  }
-  const headers = new Headers(req.headers);
-  headers.delete("authorization"); // the DO doesn't need the token
-  return agentHub(env, agent.id).fetch(new Request("https://agent.internal/ws", { headers }));
-}
-
 // ---------------------------------------------------------------- read
 
-function tier(viewer: Agent, senderOwner: string): TrustTier {
-  return tierFor(viewer.owner_id, senderOwner);
-}
-
-/** Shape a stored message for a particular viewer. The envelope is the server's word. */
-function present(viewer: Agent, roomId: string, m: StoredMessage) {
-  const envelope = { sender_id: m.sender_id, sender_owner_id: m.sender_owner_id, trust_tier: tier(viewer, m.sender_owner_id) };
-  const base = { id: `${roomId}:${m.seq}`, room: roomId, seq: m.seq, kind: m.kind, envelope, created_at: m.created_at };
-  if (m.kind === "reaction") {
-    return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
-  }
-  return { ...base, body: m.body, meta: m.meta, no_turn: false };
-}
-
-async function inbox(url: URL, env: Env, agent: Agent): Promise<Response> {
+async function inbox(url: URL, ctx: Ctx, agent: Agent): Promise<Response> {
+  const { env } = ctx;
   const since = decodeCursor(url.searchParams.get("since"));
   const rows = await memberships(env, agent.id);
   const next: Cursor = {};
@@ -294,30 +204,18 @@ async function inbox(url: URL, env: Env, agent: Agent): Promise<Response> {
     if (msgs.length > PAGE_LIMIT) { more = true; msgs.length = PAGE_LIMIT; }
     // Advance the cursor to the last message seen (own messages are skipped, not lost).
     next[r.room_id] = msgs.length ? msgs[msgs.length - 1].seq : after;
-    return msgs.map((m) => present(agent, r.room_id, m));
+    return msgs.map((m) => present(agent.owner_id, r.room_id, m));
   }));
 
   const messages = perRoom.flat().sort((a, b) => a.created_at - b.created_at);
-  return json({ messages, cursor: encodeCursor(next), more, approvals: [] });
+  return json({ messages, cursor: encodeCursor(next), more, approvals: await agentApprovals(ctx, agent) });
 }
 
 async function history(url: URL, env: Env, agent: Agent): Promise<Response> {
   const roomId = url.searchParams.get("room");
   if (!roomId) throw new HttpError(400, "missing_field", "room is required");
   await membership(env, agent.id, roomId);
-
-  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? PAGE_LIMIT) || PAGE_LIMIT, 1), 100);
-  const before = url.searchParams.get("before");
-  const after = url.searchParams.get("after");
-  const thread = url.searchParams.get("thread_id");
-
-  const msgs = await room(env, roomId).list({
-    afterSeq: after ? Number(after) : undefined,
-    beforeSeq: before ? Number(before) : after ? undefined : Number.MAX_SAFE_INTEGER,
-    threadId: thread ?? undefined,
-    limit,
-  });
-  return json({ room: roomId, messages: msgs.map((m) => present(agent, roomId, m)) });
+  return json(await readHistory(env, agent.owner_id, roomId, url));
 }
 
 async function ack(req: Request, env: Env, agent: Agent): Promise<Response> {
@@ -342,26 +240,57 @@ async function ack(req: Request, env: Env, agent: Agent): Promise<Response> {
   return json({ ok: true, rooms: updated });
 }
 
-// ---------------------------------------------------------------- admin (stub for Access)
+// ---------------------------------------------------------------- invites
 
-async function admin(req: Request, env: Env, p: string, m: string): Promise<Response> {
+/**
+ * GET /i/<code>: a browser gets a page, curl gets JSON. POST /i/<code> with an
+ * agent token accepts it, but only for the inviter's own agents: cross-owner
+ * invites are accepted by a signed-in owner.
+ */
+async function invite(req: Request, ctx: Ctx, code: string, m: string): Promise<Response> {
+  const inv = await lookupInvite(ctx, req, code);
+  if (m === "GET") {
+    const view = publicInvite(ctx, inv, code);
+    return wantsHtml(req) ? invitePage(view, ctx.origin) : json(view);
+  }
+  if (m !== "POST") throw new HttpError(405, "method_not_allowed");
+  const agent = await authAgent(req, ctx.env);
+  if (agent.owner_id !== inv.created_by) {
+    throw new HttpError(403, "owner_must_accept", `Cross-owner invites are accepted by a signed-in owner: ${ctx.origin}/accept?code=${code}`);
+  }
+  return json(await acceptInvite(ctx, inv, agent.owner_id, agent.id));
+}
+
+// ---------------------------------------------------------------- admin (operator)
+
+async function admin(req: Request, ctx: Ctx, p: string, m: string): Promise<Response> {
+  const { env } = ctx;
   const now = Date.now();
+
+  if (p === "/admin/owners" && m === "POST") {
+    // Register an owner: map the email Cloudflare Access verifies to github:<user>.
+    const b = await readBody(req);
+    const ownerId = str(b.owner_id, "owner_id", 50, true)!.toLowerCase();
+    if (!/^github:[a-z0-9-]{1,39}$/.test(ownerId)) throw new HttpError(400, "invalid_owner", "owner_id must look like github:<username>");
+    const email = str(b.email, "email", 254, true)!.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new HttpError(400, "invalid_field", "email looks wrong");
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO owners (id, created_at) VALUES (?, ?)").bind(ownerId, now),
+      env.DB.prepare("UPDATE owners SET ntfy_topic = COALESCE(ntfy_topic, ?) WHERE id = ?").bind(newNtfyTopic(), ownerId),
+      env.DB.prepare(
+        `INSERT INTO owner_emails (email, owner_id, created_at) VALUES (?, ?, ?)
+         ON CONFLICT(email) DO UPDATE SET owner_id = excluded.owner_id`,
+      ).bind(email, ownerId, now),
+    ]);
+    await audit(env, "admin", "owner.register", ownerId, { email });
+    return json({ owner_id: ownerId, email }, 201);
+  }
 
   if (p === "/admin/enroll-codes" && m === "POST") {
     const b = await readBody(req);
     const ownerId = str(b.owner_id, "owner_id", 100, true)!;
     if (!/^github:[A-Za-z0-9-]{1,39}$/.test(ownerId)) throw new HttpError(400, "invalid_owner", "owner_id must look like github:<username>");
-    const agentName = str(b.agent_name, "agent_name", 64, true)!;
-    const ttl = Math.min(Number(b.ttl_seconds ?? ENROLL_CODE_TTL_S) || ENROLL_CODE_TTL_S, 7 * 24 * 3600);
-    const code = randomString(12);
-    const expires = now + ttl * 1000;
-    await env.DB.batch([
-      env.DB.prepare("INSERT OR IGNORE INTO owners (id, created_at) VALUES (?, ?)").bind(ownerId.toLowerCase(), now),
-      env.DB.prepare("INSERT INTO enroll_codes (code_hash, owner_id, agent_name, expires_at) VALUES (?, ?, ?, ?)")
-        .bind(await sha256Hex(code), ownerId.toLowerCase(), agentName, expires),
-    ]);
-    await audit(env, "admin", "enroll_code.create", ownerId.toLowerCase(), { agent_name: agentName });
-    return json({ code, owner_id: ownerId.toLowerCase(), agent_name: agentName, expires_at: expires }, 201);
+    return json(await mintEnrollCode(env, "admin", ownerId.toLowerCase(), str(b.agent_name, "agent_name", 64, true)!, b.ttl_seconds), 201);
   }
 
   if (p === "/admin/rooms" && m === "POST") {
@@ -372,14 +301,7 @@ async function admin(req: Request, env: Env, p: string, m: string): Promise<Resp
     const createdBy = str(b.created_by, "created_by", 100) ?? "admin";
     const members = Array.isArray(b.members) ? b.members.filter((x): x is string => typeof x === "string") : [];
     if (members.length > 50) throw new HttpError(400, "too_many_members");
-    const roomId = newId("r");
-    await env.DB.batch([
-      env.DB.prepare("INSERT INTO rooms (id, name, kind, created_by, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(roomId, name, kind, createdBy, now),
-      ...members.map((a) => env.DB.prepare(
-        "INSERT INTO memberships (room_id, agent_id, role, joined_at) SELECT ?, id, 'post', ? FROM agents WHERE id = ?",
-      ).bind(roomId, now, a)),
-    ]);
+    const roomId = await createRoom(env, name, kind, createdBy, members.map((a) => ({ agent_id: a, role: "post" as const })));
     await audit(env, "admin", "room.create", roomId, { name, kind, members });
     return json({ id: roomId, name, kind, members }, 201);
   }

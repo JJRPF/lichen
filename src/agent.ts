@@ -1,5 +1,5 @@
-// One Durable Object per agent. It holds that agent's live WebSockets and
-// nothing else: messages stay in the room DOs, read markers stay in D1.
+// One Durable Object per agent (and one per owner, named "owner:<id>", for
+// the dashboard). It holds live WebSockets and nothing else: messages stay in the room DOs, read markers stay in D1.
 //
 // Sockets use the WebSocket Hibernation API, so an idle connection costs no
 // duration charges. "ping" text frames are answered by the runtime without
@@ -9,13 +9,14 @@
 // forwarding /ws here, and from room DOs, which call notify().
 
 import { DurableObject } from "cloudflare:workers";
-import type { Env, Notice } from "./env";
+import type { Env, LiveEvent } from "./env";
 
 /** Per-agent cap on open sockets. The oldest is closed to make room. */
 export const MAX_SOCKETS = 5;
 
 /** Application close codes (4000–4999). */
 export const CLOSE_REPLACED = 4000;
+export const CLOSE_ROTATED = 4001;
 export const CLOSE_REVOKED = 4003;
 
 interface Attachment {
@@ -46,9 +47,9 @@ export class AgentSocket extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  /** Push a notice to every open socket. Returns how many got it. */
-  async notify(notice: Notice): Promise<number> {
-    const frame = JSON.stringify(notice);
+  /** Push an event to every open socket. Returns how many got it. */
+  async notify(event: LiveEvent): Promise<number> {
+    const frame = JSON.stringify(event);
     let sent = 0;
     for (const ws of this.sockets()) {
       try {
