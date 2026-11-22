@@ -1,4 +1,4 @@
-// Owner API (/owner/*) and dashboard pages.
+// Owner API (/api/owner/*) and dashboard pages.
 //
 // Owners sign in with Cloudflare Access (GitHub login). The Worker verifies
 // the Access JWT itself and maps the verified email to github:<user> through
@@ -23,15 +23,19 @@ interface OwnerAuth { owner: Owner; via: "access" | "admin" }
 
 const PAGES = new Set(["/dashboard", "/approvals", "/accept"]);
 
-export async function ownerRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL): Promise<Response | null> {
-  if (m === "GET" && PAGES.has(p)) return dashboardPage(accessConfigured(ctx.env), ctx.origin);
-  if (m === "GET" && p === "/dashboard.js") {
+/** Dashboard pages and their script (GET only, no data in them). */
+export function pageRoute(ctx: Ctx, p: string): Response | null {
+  if (PAGES.has(p)) return dashboardPage(accessConfigured(ctx.env), ctx.origin);
+  if (p === "/dashboard.js") {
     return new Response(DASHBOARD_JS, {
       headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-cache", "x-content-type-options": "nosniff" },
     });
   }
-  if (!p.startsWith("/owner/")) return null;
+  return null;
+}
 
+/** /api/owner/*; `p` is the path with /api stripped. */
+export async function ownerRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL): Promise<Response> {
   const auth = await authOwner(req, ctx);
   if (auth.via === "access" && m !== "GET") checkSameOrigin(req, ctx, true);
   return ownerApi(req, ctx, auth, p, m, url);

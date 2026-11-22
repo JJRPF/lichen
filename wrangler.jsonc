@@ -41,8 +41,9 @@
     "COOLDOWN_MS": "2000",
     "MAX_BODY_BYTES": "16384",
     // Owner sign-in (Cloudflare Access with GitHub). Owner routes answer 503 until both are set.
-    "ACCESS_TEAM_DOMAIN": "",
-    "ACCESS_AUD": "",
+    // Access app "Lichen owner dashboard" (GitHub login): dashboard, approvals, accept, api/owner/*.
+    "ACCESS_TEAM_DOMAIN": "https://thepfisters.cloudflareaccess.com",
+    "ACCESS_AUD": "4f5138fb5270fde6d0c6d541d78eff947457c0565db26b65b694a6350bce4ba8",
     // Owner phone pushes; set to "" to turn them off.
     "NTFY_BASE": "https://ntfy.sh"
   }

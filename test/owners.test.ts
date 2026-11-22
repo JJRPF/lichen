@@ -290,7 +290,7 @@ describe("owner dashboard API", () => {
     const me = await owner("live");
     const b = await newAgent(me.id, "live-b");
     const roomId = await newRoom([me.agent.agent_id, b.agent_id]);
-    const bad = await SELF.fetch("https://lichen.test/owner/ws", { headers: { upgrade: "websocket", "cf-access-jwt-assertion": me.jwt, origin: "https://evil.example" } });
+    const bad = await SELF.fetch("https://lichen.test/api/owner/ws", { headers: { upgrade: "websocket", "cf-access-jwt-assertion": me.jwt, origin: "https://evil.example" } });
     expect(bad.status).toBe(403);
 
     const ws = await openSocket("/owner/ws", { "cf-access-jwt-assertion": me.jwt, origin: "https://lichen.test" });
@@ -370,9 +370,44 @@ describe("owner routes without Access configured", () => {
     // Simulated by calling the router with an env lacking ACCESS_* (unit-level).
     const { default: worker } = await import("../src/index");
     const bare = { ...env, ACCESS_TEAM_DOMAIN: "", ACCESS_AUD: "" };
-    const res = await worker.fetch(new Request("https://lichen.test/owner/me", { headers: { "cf-access-jwt-assertion": "x.y.z" } }), bare as any, {
+    const res = await worker.fetch(new Request("https://lichen.test/api/owner/me", { headers: { "cf-access-jwt-assertion": "x.y.z" } }), bare as any, {
       waitUntil() {}, passThroughOnException() {}, props: {},
     } as any);
     expect(res.status).toBe(503);
+  });
+});
+
+describe("homepage and /api layout", () => {
+  it("serves a static homepage at / and the service info at /api", async () => {
+    const res = await SELF.fetch("https://lichen.test/");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("text/html");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
+    const html = await res.text();
+    expect(html).toContain("Let your agents talk to each other.");
+    expect(html).toContain("https://lichen.test/api");
+    expect(html).not.toContain("<script");
+    expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
+    const info = await SELF.fetch("https://lichen.test/api");
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.4.0" });
+  });
+
+  it("answers the old root API paths with 404, pointing at /api", async () => {
+    const a = await newAgent("github:jjrpf", "layout");
+    for (const [method, path] of [["GET", "/inbox"], ["POST", "/send"], ["POST", "/enroll"], ["GET", "/me"], ["GET", "/owner/me"], ["POST", "/i/abcdefghjkmn"]]) {
+      const res = await SELF.fetch(`https://lichen.test${path}`, { method, headers: { authorization: `Bearer ${a.token}` } });
+      expect(res.status, `${method} ${path}`).toBe(404);
+      expect(((await res.json()) as any).message).toContain("/api/");
+    }
+    expect((await call("/me", { token: a.token })).data.agent_id).toBe(a.agent_id);
+  });
+
+  it("keeps invite links at /i/<code> for people, with JSON for curl", async () => {
+    const me = await owner("layoutinv");
+    const roomId = await newRoom([me.agent.agent_id]);
+    const { code, url } = (await ownerCall("/owner/invites", { jwt: me.jwt, body: { room: roomId } })).data;
+    expect(url).toBe(`https://lichen.test/i/${code}`);
+    const json = await SELF.fetch(url);
+    expect(((await json.json()) as any).invite.status).toBe("active");
   });
 });

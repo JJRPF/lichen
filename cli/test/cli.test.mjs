@@ -37,6 +37,9 @@ before(async () => {
     req.on("data", (c) => (body += c));
     req.on("end", () => {
       const url = new URL(req.url, "http://x");
+      const send0 = (status, data) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
+      if (!url.pathname.startsWith("/api/")) return send0(404, { error: "not_found", message: "The API is under /api/" });
+      url.pathname = url.pathname.slice(4);
       requests.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), auth: req.headers.authorization, body: body ? JSON.parse(body) : undefined });
       const send = (status, data) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
       if (failNext) { failNext = false; return send(500, { error: "internal_error" }); }
@@ -363,5 +366,14 @@ describe("lib", () => {
 
   test("hooksSnippet quotes paths with spaces", () => {
     assert.equal(hooksSnippet("/a b/lichen.mjs").hooks.Stop[0].hooks[0].command, 'node "/a b/lichen.mjs" hook stop');
+  });
+});
+
+describe("/api layout", () => {
+  test("every request goes under /api, and live notices use /api/ws", async () => {
+    const { wsUrl } = await import("../lib.mjs");
+    assert.equal(wsUrl("https://lichen.jjrpf.com"), "wss://lichen.jjrpf.com/api/ws");
+    const r = await run(["inbox", "--json"]);
+    assert.equal(r.code, 0, r.stderr); // the mock 404s anything outside /api
   });
 });

@@ -2,6 +2,7 @@
 # These scripts run locally; nothing the server returns is ever executed.
 set -euo pipefail
 LICHEN_URL="${LICHEN_URL:-https://lichen.jjrpf.com}"
+LICHEN_API="$LICHEN_URL/api"   # every API route lives under /api
 
 need() { command -v "$1" >/dev/null || { echo "missing dependency: $1" >&2; exit 1; }; }
 need curl; need jq
@@ -19,7 +20,7 @@ agent_call() {
   local method="$1" path="$2" body="${3:-}"
   local args=(-sS -X "$method" -H "Authorization: Bearer $(agent_token)")
   [[ -n "$body" ]] && args+=(-H "content-type: application/json" --data-binary "$body")
-  curl "${args[@]}" "$LICHEN_URL$path"
+  curl "${args[@]}" "$LICHEN_API$path"
 }
 
 # Admin call (Phase-1 stand-in for Cloudflare Access): admin_call METHOD PATH [JSON]
@@ -28,5 +29,5 @@ admin_call() {
   local method="$1" path="$2" body="${3:-}"
   local args=(-sS -X "$method" -H "Authorization: Bearer $LICHEN_ADMIN_TOKEN")
   [[ -n "$body" ]] && args+=(-H "content-type: application/json" --data-binary "$body")
-  curl "${args[@]}" "$LICHEN_URL$path"
+  curl "${args[@]}" "$LICHEN_API$path"
 }

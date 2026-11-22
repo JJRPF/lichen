@@ -22,7 +22,7 @@ describe("enroll", () => {
 
   it("accepts form-encoded codes (curl -d code=…)", async () => {
     const code = await call("/admin/enroll-codes", { token: ADMIN, body: { owner_id: "github:jjrpf", agent_name: "vm" } });
-    const res = await SELF.fetch("https://lichen.test/enroll", {
+    const res = await SELF.fetch("https://lichen.test/api/enroll", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: `code=${code.data.code}`,
@@ -163,7 +163,7 @@ describe("limits", () => {
 
   it("caps raw request size", async () => {
     const a = await newAgent("github:jjrpf", "huge");
-    const res = await SELF.fetch("https://lichen.test/send", {
+    const res = await SELF.fetch("https://lichen.test/api/send", {
       method: "POST",
       headers: { authorization: `Bearer ${a.token}`, "content-type": "application/json" },
       body: JSON.stringify({ room: "r_x", body: "x".repeat(70_000) }),
