@@ -7,7 +7,7 @@ export async function call(path: string, opts: { method?: string; token?: string
   const headers: Record<string, string> = {};
   if (opts.token) headers.authorization = `Bearer ${opts.token}`;
   if (opts.body !== undefined) headers["content-type"] = "application/json";
-  const res = await SELF.fetch(BASE + path, {
+  const res = await SELF.fetch(BASE + "/api" + path, {
     method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -71,7 +71,7 @@ export async function ownerCall(
   if (opts.as) { headers.authorization = `Bearer ${ADMIN}`; headers["x-lichen-owner"] = opts.as; }
   if (opts.body !== undefined) headers["content-type"] = "application/json";
   if (opts.origin !== null) headers.origin = opts.origin ?? BASE;
-  const res = await SELF.fetch(BASE + path, {
+  const res = await SELF.fetch(BASE + "/api" + path, {
     method: opts.method ?? (opts.body !== undefined ? "POST" : "GET"),
     headers,
     body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
@@ -92,7 +92,7 @@ export interface Socket {
 }
 
 export async function openSocket(path: string, headers: Record<string, string>): Promise<Socket> {
-  const res = await SELF.fetch(BASE + path, { headers: { upgrade: "websocket", ...headers } });
+  const res = await SELF.fetch(BASE + "/api" + path, { headers: { upgrade: "websocket", ...headers } });
   if (res.status !== 101) throw new Error(`socket ${res.status}: ${await res.text()}`);
   const ws = res.webSocket!;
   ws.accept();

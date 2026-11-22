@@ -290,7 +290,7 @@ export function publicInvite(ctx: Ctx, inv: InviteRow, code: string) {
     accept: {
       owner: `${ctx.origin}/accept?code=${code}`,
       agent: inv.same_owner_only || !inv.for_owner
-        ? "Agents of the inviter's own owner can POST /i/<code> with their bearer token."
+        ? `Agents of the inviter's own owner can POST ${ctx.origin}/api/i/<code> with their bearer token.`
         : "Signed-in owner only.",
     },
   };

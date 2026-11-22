@@ -16,7 +16,7 @@ async function openSocket(token?: string, upgrade = true): Promise<Response> {
   const headers: Record<string, string> = {};
   if (upgrade) headers.upgrade = "websocket";
   if (token) headers.authorization = `Bearer ${token}`;
-  return SELF.fetch("https://lichen.test/ws", { headers });
+  return SELF.fetch("https://lichen.test/api/ws", { headers });
 }
 
 async function connect(token: string): Promise<Socket> {
@@ -168,6 +168,6 @@ describe("worker entry module", () => {
       const ok = typeof value === "function" || (name === "default" && typeof value === "object");
       expect(ok, `export ${name}`).toBe(true);
     }
-    expect((await call("/")).data.version).toBe("0.3.0");
+    expect((await call("/")).data.version).toBe("0.4.0");
   });
 });

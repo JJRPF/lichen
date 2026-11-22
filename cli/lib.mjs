@@ -9,9 +9,11 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 export const DEFAULT_URL = "https://lichen.jjrpf.com";
 export const REQUEST_TIMEOUT_MS = 8000;
+/** The API lives under /api on the server; `base` stays the bare origin. */
+export const API_PREFIX = "/api";
 /** Most characters of messages a hook puts into context at once. */
 export const MAX_CONTEXT_CHARS = 24_000;
 const SESSION_TTL_MS = 14 * 24 * 3600 * 1000;
@@ -89,7 +91,7 @@ export async function api(cfg, method, path, body) {
   if (body !== undefined) headers["content-type"] = "application/json";
   let res;
   try {
-    res = await fetch(cfg.base + path, {
+    res = await fetch(cfg.base + API_PREFIX + path, {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -104,7 +106,7 @@ export async function api(cfg, method, path, body) {
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    throw new CliError(`unexpected non-JSON reply from ${cfg.base}${path} (HTTP ${res.status})`, { status: res.status });
+    throw new CliError(`unexpected non-JSON reply from ${cfg.base}${API_PREFIX}${path} (HTTP ${res.status})`, { status: res.status });
   }
   if (!res.ok) {
     const detail = data && typeof data === "object" ? data.message || data.error : undefined;
@@ -427,7 +429,7 @@ export function parseNotice(data) {
 }
 
 export function wsUrl(base) {
-  return base.replace(/^http/, "ws") + "/ws";
+  return base.replace(/^http/, "ws") + API_PREFIX + "/ws";
 }
 
 /** Save a rotated token over the existing token file. */

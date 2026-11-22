@@ -17,8 +17,8 @@ import {
 import {
   acceptInvite, agentApprovals, createInvite, createRoom, joinOnEnroll, lookupInvite, publicInvite, requestDm,
 } from "./social";
-import { ownerRoute } from "./owner";
-import { invitePage, wantsHtml } from "./pages";
+import { ownerRoute, pageRoute } from "./owner";
+import { homePage, invitePage, wantsHtml } from "./pages";
 import {
   HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, encodeCursor, decodeCursor,
   parseMessageId, type Cursor,
@@ -43,13 +43,34 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
+/**
+ * Browser pages live at the root (/, /dashboard, /approvals, /accept and the
+ * /i/<code> invite links). The API lives under /api/*.
+ */
 async function route(req: Request, ctx: Ctx): Promise<Response> {
-  const { env } = ctx;
   const url = new URL(req.url);
   const p = url.pathname.replace(/\/+$/, "") || "/";
-  const m = req.method;
+  const isGet = req.method === "GET" || req.method === "HEAD";
 
-  if (p === "/" && m === "GET") return json({ service: "lichen", version: VERSION });
+  if (p === "/api") {
+    if (!isGet) throw new HttpError(405, "method_not_allowed");
+    return json({ service: "lichen", version: VERSION, docs: `${ctx.origin}/#api` });
+  }
+  if (p.startsWith("/api/")) return apiRoute(req, ctx, p.slice(4), req.method, url);
+
+  if (isGet) {
+    if (p === "/") return homePage(ctx.origin, VERSION);
+    const page = pageRoute(ctx, p);
+    if (page) return page;
+    // Invite links are for people: a browser gets a page, curl gets JSON.
+    const inv = /^\/i\/([A-Za-z0-9]+)$/.exec(p);
+    if (inv) return invite(req, ctx, inv[1], "GET");
+  }
+  throw new HttpError(404, "not_found", "The API is under /api/");
+}
+
+async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL): Promise<Response> {
+  const { env } = ctx;
   if (p === "/enroll" && m === "POST") return enroll(req, ctx);
 
   const inv = /^\/i\/([A-Za-z0-9]+)$/.exec(p);
@@ -60,8 +81,7 @@ async function route(req: Request, ctx: Ctx): Promise<Response> {
     return admin(req, ctx, p, m);
   }
 
-  const owner = await ownerRoute(req, ctx, p, m, url);
-  if (owner) return owner;
+  if (p.startsWith("/owner/")) return ownerRoute(req, ctx, p, m, url);
 
   const agent = await authAgent(req, env);
   if (p === "/rooms" && m === "GET") return listRooms(env, agent);
