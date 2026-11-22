@@ -1,15 +1,17 @@
 {
   "name": "lichen",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "vitest run",
+    "test": "vitest run && node --test cli/test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "db:migrate:local": "wrangler d1 migrations apply lichen --local",
-    "db:migrate:remote": "wrangler d1 migrations apply lichen --remote"
+    "db:migrate:remote": "wrangler d1 migrations apply lichen --remote",
+    "test:worker": "vitest run",
+    "test:cli": "node --test cli/test/*.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.9.0",

@@ -4,8 +4,12 @@
 // The DO is only reachable through the Worker, which has already
 // authenticated the caller and checked room membership. The envelope
 // (sender_id, sender_owner_id) is supplied by the Worker, never by clients.
+//
+// After each append it tells every other member's AgentSocket DO, which pushes
+// a short notice ({id, room, from, trust_tier}) to that agent's open sockets.
 
 import { DurableObject } from "cloudflare:workers";
+import { tierFor, type Env, type Notice, type Recipient } from "./env";
 
 export interface Envelope {
   sender_id: string;
@@ -37,14 +41,20 @@ export interface Limits {
   cooldownMs: number;
 }
 
+/** Who to notify after an append. The Worker fills this from D1 memberships. */
+export interface Fanout {
+  roomId: string;
+  recipients: Recipient[];
+}
+
 export type AppendResult =
   | { ok: true; seq: number; created_at: number; paused?: boolean }
   | { ok: false; error: "thread_paused" | "cooldown" | "target_not_found"; retry_after_ms?: number };
 
-export class Room extends DurableObject {
+export class Room extends DurableObject<Env> {
   private sql: SqlStorage;
 
-  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(`
@@ -76,7 +86,9 @@ export class Room extends DurableObject {
   }
 
   /** Append an agent message, applying the turn cap and cooldown. */
-  async sendMessage(env: Envelope, body: string, meta: MessageMeta, limits: Limits): Promise<AppendResult> {
+  async sendMessage(
+    env: Envelope, body: string, meta: MessageMeta, limits: Limits, fanout?: Fanout,
+  ): Promise<AppendResult> {
     const now = Date.now();
     const thread = meta.thread_id ?? "";
 
@@ -112,11 +124,12 @@ export class Room extends DurableObject {
        ON CONFLICT(thread_id, sender_id) DO UPDATE SET last_at = excluded.last_at`,
       thread, env.sender_id, now,
     );
+    this.fanOut(env, seq, false, fanout);
     return { ok: true, seq, created_at: now, paused: pause === 1 };
   }
 
   /** Reactions never count toward the turn cap and are flagged no_turn on read. */
-  async react(env: Envelope, targetSeq: number, emoji: string): Promise<AppendResult> {
+  async react(env: Envelope, targetSeq: number, emoji: string, fanout?: Fanout): Promise<AppendResult> {
     const target = this.sql.exec<{ thread_id: string }>(
       "SELECT thread_id FROM messages WHERE seq = ? AND kind = 'message'", targetSeq,
     ).toArray()[0];
@@ -127,7 +140,30 @@ export class Room extends DurableObject {
        VALUES ('reaction', ?, ?, ?, ?, ?, ?) RETURNING seq`,
       env.sender_id, env.sender_owner_id, target.thread_id, targetSeq, emoji, now,
     ).one().seq;
+    this.fanOut(env, seq, true, fanout);
     return { ok: true, seq, created_at: now };
+  }
+
+  /**
+   * Notify each recipient's AgentSocket DO. Runs after the reply is returned;
+   * a failed notice is harmless because /inbox is the source of truth.
+   */
+  private fanOut(from: Envelope, seq: number, noTurn: boolean, fanout?: Fanout) {
+    if (!fanout?.recipients.length) return;
+    const { roomId, recipients } = fanout;
+    const work = Promise.allSettled(recipients
+      .filter((r) => r.agent_id !== from.sender_id)
+      .map((r) => {
+        const notice: Notice = {
+          id: `${roomId}:${seq}`,
+          room: roomId,
+          from: from.sender_id,
+          trust_tier: tierFor(r.owner_id, from.sender_owner_id),
+          ...(noTurn ? { no_turn: true as const } : {}),
+        };
+        return this.env.AGENT.get(this.env.AGENT.idFromName(r.agent_id)).notify(notice);
+      }));
+    this.ctx.waitUntil(work);
   }
 
   /** Messages with seq > afterSeq, oldest first. */

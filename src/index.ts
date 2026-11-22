@@ -1,33 +1,25 @@
 // Lichen — agent-to-agent messaging on Cloudflare's free plan.
 // Phase 1: enroll, rooms, send, react, inbox, history, ack.
+// Phase 2: /ws live notices (one AgentSocket DO per agent, hibernating sockets).
 //
 // Every response is JSON data. Nothing the server returns is meant to be executed.
 
-import { Room, type Envelope, type MessageMeta, type StoredMessage } from "./room";
+import { Room, type Envelope, type Fanout, type MessageMeta, type StoredMessage } from "./room";
+import { AgentSocket } from "./agent";
+import { VERSION, tierFor, type Env, type TrustTier } from "./env";
 import {
   HttpError, json, errorResponse, newId, newToken, randomString, sha256Hex, safeEqual,
   readBody, str, bool, encodeCursor, decodeCursor, parseMessageId, type Cursor,
 } from "./util";
 
-export { Room };
-
-export interface Env {
-  DB: D1Database;
-  ROOM: DurableObjectNamespace<Room>;
-  RATE_LIMITER?: RateLimit;
-  ADMIN_TOKEN?: string;
-  TURN_CAP?: string;
-  COOLDOWN_MS?: string;
-  MAX_BODY_BYTES?: string;
-}
+export { Room, AgentSocket };
+export type { Env };
 
 interface Agent {
   id: string;
   owner_id: string;
   name: string;
 }
-
-type TrustTier = "same_owner" | "external";
 
 const REACTIONS = new Set(["👍", "✅", "👀", "❌", "🎉"]);
 const ENROLL_CODE_TTL_S = 24 * 60 * 60;
@@ -48,7 +40,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   const p = url.pathname.replace(/\/+$/, "") || "/";
   const m = req.method;
 
-  if (p === "/" && m === "GET") return json({ service: "lichen", version: "0.1.0" });
+  if (p === "/" && m === "GET") return json({ service: "lichen", version: VERSION });
   if (p === "/enroll" && m === "POST") return enroll(req, env);
 
   if (p.startsWith("/admin/")) {
@@ -63,6 +55,7 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (p === "/inbox" && m === "GET") return inbox(url, env, agent);
   if (p === "/history" && m === "GET") return history(url, env, agent);
   if (p === "/ack" && m === "POST") return ack(req, env, agent);
+  if (p === "/ws" && m === "GET") return connect(req, env, agent);
   if (p === "/me" && m === "GET") return json({ agent_id: agent.id, owner_id: agent.owner_id, name: agent.name });
 
   throw new HttpError(404, "not_found");
@@ -170,6 +163,27 @@ async function listRooms(env: Env, agent: Agent): Promise<Response> {
 }
 
 const room = (env: Env, roomId: string) => env.ROOM.get(env.ROOM.idFromName(roomId));
+const agentHub = (env: Env, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentId));
+
+interface MemberRow { agent_id: string; owner_id: string; role: string }
+
+/**
+ * The caller's membership plus everyone else who should get a live notice,
+ * in one D1 query. Same 404 for "no such room" and "not a member".
+ */
+async function postingMembership(env: Env, agent: Agent, roomId: string): Promise<Fanout> {
+  const { results } = await env.DB.prepare(
+    `SELECT m.agent_id, a.owner_id, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
+     WHERE m.room_id = ? AND a.status = 'active'`,
+  ).bind(roomId).all<MemberRow>();
+  const me = results.find((r) => r.agent_id === agent.id);
+  if (!me) throw new HttpError(404, "room_not_found");
+  if (me.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
+  return {
+    roomId,
+    recipients: results.filter((r) => r.agent_id !== agent.id).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
+  };
+}
 
 // ---------------------------------------------------------------- send / react
 
@@ -199,14 +213,13 @@ async function send(req: Request, env: Env, agent: Agent): Promise<Response> {
   // Allow metadata either flat or nested under "meta".
   const meta = cleanMeta(b.meta && typeof b.meta === "object" ? { ...(b.meta as object) } as Record<string, unknown> : b);
 
-  const m = await membership(env, agent.id, roomId);
-  if (m.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
+  const fanout = await postingMembership(env, agent, roomId);
 
   const envelope: Envelope = { sender_id: agent.id, sender_owner_id: agent.owner_id };
   const res = await room(env, roomId).sendMessage(envelope, text, meta, {
     turnCap: Number(env.TURN_CAP ?? 10),
     cooldownMs: Number(env.COOLDOWN_MS ?? 2000),
-  });
+  }, fanout);
   if (!res.ok) {
     if (res.error === "thread_paused") {
       throw new HttpError(409, "thread_paused", "Turn cap reached; an owner must resume this thread");
@@ -226,20 +239,36 @@ async function react(req: Request, env: Env, agent: Agent): Promise<Response> {
   const emoji = str(b.emoji, "emoji", 16, true)!;
   if (!REACTIONS.has(emoji)) throw new HttpError(400, "invalid_emoji", `emoji must be one of ${[...REACTIONS].join(" ")}`);
 
-  const m = await membership(env, agent.id, roomId);
-  if (m.role !== "post") throw new HttpError(403, "read_only");
+  const fanout = await postingMembership(env, agent, roomId);
 
-  const res = await room(env, roomId).react({ sender_id: agent.id, sender_owner_id: agent.owner_id }, seq, emoji);
+  const res = await room(env, roomId).react({ sender_id: agent.id, sender_owner_id: agent.owner_id }, seq, emoji, fanout);
   if (!res.ok) throw new HttpError(404, "message_not_found");
   const id = `${roomId}:${res.seq}`;
   await audit(env, agent.id, "react", id, { target: `${roomId}:${seq}`, emoji });
   return json({ id, room: roomId, seq: res.seq, no_turn: true }, 201);
 }
 
+// ---------------------------------------------------------------- live notices
+
+/**
+ * GET /ws (WebSocket upgrade). The token is checked here, then the upgrade is
+ * handed to this agent's AgentSocket DO. The socket only ever carries notices
+ * ({id, room, from, trust_tier}, plus no_turn for reactions); bodies are read
+ * from /inbox.
+ */
+async function connect(req: Request, env: Env, agent: Agent): Promise<Response> {
+  if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    throw new HttpError(426, "upgrade_required", "Connect with a WebSocket client");
+  }
+  const headers = new Headers(req.headers);
+  headers.delete("authorization"); // the DO doesn't need the token
+  return agentHub(env, agent.id).fetch(new Request("https://agent.internal/ws", { headers }));
+}
+
 // ---------------------------------------------------------------- read
 
 function tier(viewer: Agent, senderOwner: string): TrustTier {
-  return viewer.owner_id === senderOwner ? "same_owner" : "external";
+  return tierFor(viewer.owner_id, senderOwner);
 }
 
 /** Shape a stored message for a particular viewer. The envelope is the server's word. */
@@ -384,6 +413,7 @@ async function admin(req: Request, env: Env, p: string, m: string): Promise<Resp
   if (mm && m === "POST") {
     const res = await env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(mm[1]).run();
     if (!res.meta.changes) throw new HttpError(404, "not_found");
+    await agentHub(env, mm[1]).closeAll();
     await audit(env, "admin", "agent.revoke", mm[1]);
     return json({ ok: true, agent_id: mm[1], status: "revoked" });
   }
