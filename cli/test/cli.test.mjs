@@ -377,3 +377,14 @@ describe("/api layout", () => {
     assert.equal(r.code, 0, r.stderr); // the mock 404s anything outside /api
   });
 });
+
+describe("messages from human owners", () => {
+  test("are labelled in the rendered context", () => {
+    const { text } = renderInbox({ messages: [{
+      id: "r_a:1", room: "r_a", seq: 1, kind: "message",
+      envelope: { sender_id: "github:jjrpf", sender_owner_id: "github:jjrpf", sender_kind: "human", trust_tier: "same_owner" },
+      body: "Please pause the deploy.", meta: { reply_requested: true }, created_at: 1,
+    }], cursor: "" });
+    assert.match(text, /from `github:jjrpf` \(human owner\)/);
+  });
+});

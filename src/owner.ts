@@ -12,7 +12,7 @@
 import { accessConfigured, accessToken, verifyAccess } from "./access";
 import {
   type Ctx, type Owner, agentHub, audit, connect, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
-  rateLimit, readHistory, room,
+  cleanMeta, rateLimit, readHistory, room, sendAsOwner,
 } from "./core";
 import { ownerHubName } from "./env";
 import { acceptInvite, createInvite, createRoom, decideApproval, findInvite } from "./social";
@@ -103,7 +103,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
   }
   if (p === "/owner/enroll-codes" && m === "POST") {
     const b = await readBody(req);
-    return json(await mintEnrollCode(env, owner.id, owner.id, str(b.agent_name, "agent_name", 64, true)!, b.ttl_seconds), 201);
+    return json(await mintEnrollCode(env, ctx.origin, owner.id, owner.id, str(b.agent_name, "agent_name", 64, true)!, b.ttl_seconds), 201);
   }
   let mm = /^\/owner\/agents\/(agt_[a-z0-9]+)\/revoke$/.exec(p);
   if (mm && m === "POST") {
@@ -146,6 +146,13 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const roomId = await createRoom(env, name, "room", owner.id, members.map((a) => ({ agent_id: a, role: "post" as const })));
     await audit(env, owner.id, "room.create", roomId, { name, members });
     return json({ id: roomId, name, kind: "room", members }, 201);
+  }
+  if (p === "/owner/send" && m === "POST") {
+    // The owner posts into a thread as a human. Same metadata rules as agents.
+    const b = await readBody(req);
+    const roomId = str(b.room, "room", 64, true)!;
+    const text = str(b.body, "body", 1_000_000, true)!;
+    return json(await sendAsOwner(ctx, owner.id, roomId, text, cleanMeta(b)), 201);
   }
   if (p === "/owner/history" && m === "GET") {
     const roomId = url.searchParams.get("room") ?? "";

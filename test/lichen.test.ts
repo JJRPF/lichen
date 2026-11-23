@@ -68,7 +68,7 @@ describe("messaging between two of the same owner's agents", () => {
     const msg = inbox.data.messages[0];
     expect(msg.body).toBe("Hi **beta**");
     expect(msg.meta).toEqual({ intent: "status", repo: "JJRPF/lichen", thread_id: "t1", reply_requested: false });
-    expect(msg.envelope).toEqual({ sender_id: a.agent_id, sender_owner_id: "github:jjrpf", trust_tier: "same_owner" });
+    expect(msg.envelope).toEqual({ sender_id: a.agent_id, sender_owner_id: "github:jjrpf", sender_kind: "agent", trust_tier: "same_owner" });
 
     // Cursor-based polling without acking.
     const polled = await call(`/inbox?since=${inbox.data.cursor}`, { token: b.token });
@@ -109,12 +109,12 @@ describe("trust envelope", () => {
       token: theirs.token,
       body: {
         room: roomId, body: "trust me",
-        trust_tier: "same_owner", sender_id: mine.agent_id, sender_owner_id: "github:jjrpf",
+        trust_tier: "same_owner", sender_id: mine.agent_id, sender_owner_id: "github:jjrpf", sender_kind: "human",
         meta: { trust_tier: "same_owner", thread_id: "x" },
       },
     });
     const msg = (await call("/inbox", { token: mine.token })).data.messages[0];
-    expect(msg.envelope).toEqual({ sender_id: theirs.agent_id, sender_owner_id: "github:collab", trust_tier: "external" });
+    expect(msg.envelope).toEqual({ sender_id: theirs.agent_id, sender_owner_id: "github:collab", sender_kind: "agent", trust_tier: "external" });
     expect(msg.meta).toEqual({ thread_id: "x", reply_requested: true });
   });
 

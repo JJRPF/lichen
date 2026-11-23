@@ -3,6 +3,7 @@
 import type { Envelope, Fanout, MessageMeta, StoredMessage } from "./room";
 import { ownerHubName, tierFor, type Env, type LiveEvent, type TrustTier } from "./env";
 import { HttpError, randomString, safeEqual, sha256Hex, str, bool } from "./util";
+import { agentPrompt } from "./guide";
 
 const ENROLL_CODE_TTL_S = 24 * 60 * 60;
 
@@ -162,11 +163,33 @@ export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: st
   return { id, room: fanout.roomId, seq: res.seq, created_at: res.created_at, thread_paused: res.paused ?? false };
 }
 
+/**
+ * An owner posts into a room from the dashboard, as a human. The owner must
+ * have at least one active agent in the room. Every agent member is notified,
+ * and the thread's turn-cap streak resets.
+ */
+export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, text: string, meta: MessageMeta): Promise<Sent> {
+  const { env } = ctx;
+  checkBodySize(env, text);
+  const { results } = await env.DB.prepare(
+    `SELECT m.agent_id, a.owner_id FROM memberships m JOIN agents a ON a.id = m.agent_id
+     WHERE m.room_id = ? AND a.status = 'active'`,
+  ).bind(roomId).all<{ agent_id: string; owner_id: string }>();
+  if (!results.some((r) => r.owner_id === ownerId)) throw new HttpError(404, "room_not_found");
+  const fanout: Fanout = { roomId, recipients: results, owners: [...new Set(results.map((r) => r.owner_id))] };
+  const res = await room(env, roomId).sendHuman({ sender_id: ownerId, sender_owner_id: ownerId }, text, meta, fanout);
+  const id = `${roomId}:${res.seq}`;
+  await audit(env, ownerId, "owner.send", id, { thread_id: meta.thread_id ?? null, bytes: text.length });
+  return { id, room: roomId, seq: res.seq, created_at: res.created_at, thread_paused: false };
+}
+
 // ---------------------------------------------------------------- reading
 
 export function present(viewerOwner: string, roomId: string, m: StoredMessage) {
   const trust_tier: TrustTier = tierFor(viewerOwner, m.sender_owner_id);
-  const envelope = { sender_id: m.sender_id, sender_owner_id: m.sender_owner_id, trust_tier };
+  // Owners post as themselves (github:<user>) from the dashboard; agents as agt_….
+  const sender_kind = m.sender_id.startsWith("github:") ? "human" : "agent";
+  const envelope = { sender_id: m.sender_id, sender_owner_id: m.sender_owner_id, sender_kind, trust_tier };
   const base = { id: `${roomId}:${m.seq}`, room: roomId, seq: m.seq, kind: m.kind, envelope, created_at: m.created_at };
   if (m.kind === "reaction") {
     return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
@@ -244,7 +267,7 @@ export async function ownerCanSeeRoom(env: Env, ownerId: string, roomId: string)
 // ---------------------------------------------------------------- enroll codes / sockets
 
 /** One-time enroll code for a new agent of `ownerId` (same_owner by construction). */
-export async function mintEnrollCode(env: Env, actor: string, ownerId: string, agentName: string, ttlRaw: unknown) {
+export async function mintEnrollCode(env: Env, origin: string, actor: string, ownerId: string, agentName: string, ttlRaw: unknown) {
   const now = Date.now();
   const ttl = Math.min(Number(ttlRaw ?? ENROLL_CODE_TTL_S) || ENROLL_CODE_TTL_S, 7 * 24 * 3600);
   const code = randomString(12);
@@ -255,7 +278,12 @@ export async function mintEnrollCode(env: Env, actor: string, ownerId: string, a
       .bind(await sha256Hex(code), ownerId, agentName, expires),
   ]);
   await audit(env, actor, "enroll_code.create", ownerId, { agent_name: agentName });
-  return { code, owner_id: ownerId, agent_name: agentName, expires_at: expires };
+  return {
+    code, owner_id: ownerId, agent_name: agentName, expires_at: expires,
+    curl: `curl -s -X POST ${origin}/api/enroll -d code=${code}`,
+    // Paste this into the agent: it explains Lichen and enrolls with plain curl.
+    prompt: agentPrompt(origin, code, ownerId, agentName),
+  };
 }
 
 /**

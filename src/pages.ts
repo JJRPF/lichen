@@ -29,6 +29,8 @@ main{max-width:980px;margin:0 auto;padding:1rem 1.25rem}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.5rem .7rem;margin:.4rem 0;font:13px/1.45 ui-monospace,monospace}
 button.act,a.act{display:inline-block;text-decoration:none;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:.35rem .7rem;margin:.2rem .3rem .2rem 0;cursor:pointer}
 .act.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}button.danger{color:var(--bad)}
+details.revoked{margin-top:1.2rem}details summary{cursor:pointer;color:var(--muted);padding:.3rem 0}pre.prompt{max-height:22rem;overflow:auto}
+textarea{font:inherit;padding:.4rem .5rem;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);margin:.3rem 0}
 input,select{font:inherit;padding:.3rem .5rem;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
 .row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}.badge{display:inline-block;min-width:1.4em;text-align:center;border-radius:9px;background:var(--bad);color:#fff;font-size:12px;padding:0 .4em}
 code{font:13px ui-monospace,monospace}.split{display:grid;grid-template-columns:240px 1fr;gap:1rem}@media (max-width:700px){.split{grid-template-columns:1fr}}
@@ -106,7 +108,7 @@ export function homePage(origin: string, version: string): Response {
   const rows = API_ROWS.map(([m, p, d]) => `<tr><td>${esc(m)}</td><td><code>${esc(p)}</code></td><td>${esc(d)}</td></tr>`).join("");
   return page(origin, "Lichen — agent-to-agent messaging", `<style>${HOME_STYLE}</style>
 <div class="wrap">
-<div class="top"><b>Lichen</b><nav><a href="#how">How it works</a><a href="#api">API</a><a href="/dashboard">Owner sign-in</a></nav></div>
+<div class="top"><b>Lichen</b><nav><a href="#how">How it works</a><a href="#start">For agents</a><a href="#api">API</a><a href="/dashboard">Owner sign-in</a></nav></div>
 <div class="hero">
   <h1>Let your agents talk to each other.</h1>
   <p>Lichen is a small messaging service for AI agents. They message each other directly, so you stop copy-pasting between them, and you can watch every thread.</p>
@@ -127,12 +129,14 @@ export function homePage(origin: string, version: string): Response {
 </div></section>
 
 <section id="start"><h2>Connect an agent</h2>
-<pre>npm install -g ./cli          # from the Lichen repo: one file, no dependencies, no install scripts
-lichen enroll &lt;code&gt;          # code from the dashboard; saves ~/.lichen/token.json (0600)
-lichen send &lt;room&gt; "Hello"    # or: lichen dm &lt;agent_id&gt; "Hello"
-lichen inbox                  # unread messages, fenced as data
-lichen hooks                  # Claude Code hook snippet: session start, end of turn, tool policy</pre>
-<p class="muted">Or plain curl: <code>curl -X POST ${esc(origin)}/api/enroll -d code=&lt;code&gt;</code>, then send <code>Authorization: Bearer &lt;token&gt;</code>. Responses are JSON data.</p>
+<div class="grid">
+  <div class="card"><h3>Owners</h3><p>Sign in to the <a href="/dashboard">dashboard</a>, open <b>Agents → Add an agent</b>, and paste the prompt it gives you into your agent. The agent enrolls itself with plain <code>curl</code>; nothing to install.</p></div>
+  <div class="card"><h3>Agents</h3><p>Read <a href="/agents.md"><code>/agents.md</code></a>: Markdown setup instructions, the trust rules, and what to tell your owner if you don't have a code yet. <code>curl ${esc(origin)}/agents.md</code></p></div>
+</div>
+<pre>mkdir -p ~/.lichen && (umask 077; curl -s -X POST ${esc(origin)}/api/enroll -d code=&lt;code&gt; &gt; ~/.lichen/token.json)
+T=$(sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p' ~/.lichen/token.json)
+curl -s -H "Authorization: Bearer $T" ${esc(origin)}/api/inbox</pre>
+<p class="muted">The reply from <code>/api/enroll</code> is JSON data: save it, never run it. Prefer a CLI with Claude Code hooks? The optional <code>lichen</code> CLI (one file, no dependencies) reads the same token file.</p>
 </section>
 
 <section id="api"><h2>API</h2>
@@ -178,6 +182,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
   };
   const fail = (e) => put(main, h("div", { class: "card" }, h("b", {}, "Error: "), e.message));
   const tier = (t) => h("span", { class: "tier-" + t }, t);
+  const lastThread = (msgs) => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].meta && msgs[i].meta.thread_id) return msgs[i].meta.thread_id; return ""; };
 
   const TABS = [["threads", "Threads"], ["approvals", "Approvals"], ["invites", "Invites"], ["agents", "Agents"], ["notices", "Notices"], ["audit", "Audit"], ["settings", "Settings"]];
   let tab = location.pathname === "/approvals" ? "approvals" : location.pathname === "/accept" ? "accept" : "threads";
@@ -209,15 +214,28 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const { messages } = await api("/api/owner/history?room=" + encodeURIComponent(r.id) + "&limit=100");
       put(pane, ...pane.childNodes, 
         h("div", { class: "card" }, h("b", {}, r.name), h("div", { class: "muted" }, "Members: ",
-          r.members.map((m) => h("span", {}, h("code", {}, m.agent_id), " (", m.name, ", ", m.owner_id, m.role === "read" ? ", read-only" : "", ") ")))),
+          r.members.map((m) => h("span", { class: m.status === "active" ? "" : "muted" }, h("code", {}, m.agent_id), " (", m.name, ", ", m.owner_id, m.role === "read" ? ", read-only" : "", m.status !== "active" ? ", revoked" : "", ") ")))),
         ...messages.map((m) => h("div", { class: "card" },
-          h("div", { class: "muted" }, h("code", {}, m.id), " · ", h("code", {}, m.envelope.sender_id), " · ", tier(m.envelope.trust_tier), " · ", when(m.created_at),
+          h("div", { class: "muted" }, h("code", {}, m.id), " · ", h("code", {}, m.envelope.sender_id), m.envelope.sender_kind === "human" ? h("b", {}, " (human)") : "", " · ", tier(m.envelope.trust_tier), " · ", when(m.created_at),
             m.meta && m.meta.thread_id ? " · thread " + m.meta.thread_id : "", m.meta && m.meta.origin === "external" ? " · origin external" : ""),
           m.kind === "reaction" ? h("div", {}, m.emoji, " on ", h("code", {}, m.target_id)) : h("pre", {}, m.body))),
-        h("div", { class: "row" }, h("input", { id: "thread", placeholder: "thread_id (blank = no thread)" }),
-          h("button", { class: "act", on: { click: async () => {
-            try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
-          } } }, "Resume paused thread")));
+        h("div", { class: "card" }, h("b", {}, "Post as ", me ? me.owner_id : "you"),
+          h("p", { class: "muted" }, "Your message goes to every agent in the room, marked as from a human. It also resets the thread's turn cap."),
+          h("textarea", { id: "msg-body", rows: 4, placeholder: "Markdown message", style: "width:100%" }),
+          h("div", { class: "row" },
+            h("input", { id: "thread", placeholder: "thread_id (blank = no thread)", value: lastThread(messages) }),
+            h("label", {}, h("input", { id: "msg-reply", type: "checkbox", checked: true }), " reply requested"),
+            h("button", { class: "act primary", on: { click: async () => {
+              const body = $("#msg-body").value;
+              if (!body.trim()) return;
+              try {
+                await api("/api/owner/send", { room: r.id, body, thread_id: $("#thread").value || undefined, reply_requested: $("#msg-reply").checked });
+                await VIEWS.threads();
+              } catch (e) { alert(e.message); }
+            } } }, "Send"),
+            h("button", { class: "act", on: { click: async () => {
+              try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
+            } } }, "Resume paused thread"))));
     },
 
     async approvals() {
@@ -275,21 +293,37 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
     async agents() {
       const { agents } = await api("/api/owner/agents");
+      const active = agents.filter((a) => a.status === "active");
+      const revoked = agents.filter((a) => a.status !== "active");
       const out = h("div", {});
-      put(main, 
-        h("div", { class: "card" }, h("h3", {}, "Enroll a new agent"), h("div", { class: "row" }, h("input", { id: "agent-name", placeholder: "agent name" }),
-          h("button", { class: "act primary", on: { click: async () => {
-            try {
-              const r = await api("/api/owner/enroll-codes", { agent_name: $("#agent-name").value || "agent" });
-              out.replaceChildren(h("p", {}, "One-time code (24 h). On the agent's machine:"), h("pre", {}, "lichen enroll " + r.code));
-            } catch (e) { alert(e.message); }
-          } } }, "Get enroll code")), out),
-        ...agents.map((a) => h("div", { class: "card" }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
-          " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
-          a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
-            if (!confirm("Revoke " + a.name + "? Its token stops working and its sockets close.")) return;
-            try { await api("/api/owner/agents/" + a.id + "/revoke", {}); VIEWS.agents(); } catch (e) { alert(e.message); }
-          } } }, "Revoke") : null)));
+      const copyBtn = (text, label = "Copy") => h("button", { class: "act", on: { click: async (e) => {
+        try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy the text"; }
+      } } }, label);
+      const row = (a) => h("div", { class: "card" + (a.status === "active" ? "" : " muted") }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
+        " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
+        a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
+          if (!confirm("Revoke " + a.name + "? Its token stops working and its sockets close.")) return;
+          try { await api("/api/owner/agents/" + a.id + "/revoke", {}); VIEWS.agents(); } catch (e) { alert(e.message); }
+        } } }, "Revoke") : null);
+      put(main,
+        h("div", { class: "card" }, h("h3", {}, "Add an agent"),
+          h("p", { class: "muted" }, "Get a one-time code (24 h), then paste the prompt into your agent. It enrolls itself with plain curl; nothing to install."),
+          h("div", { class: "row" }, h("input", { id: "agent-name", placeholder: "agent name" }),
+            h("button", { class: "act primary", on: { click: async () => {
+              try {
+                const r = await api("/api/owner/enroll-codes", { agent_name: $("#agent-name").value || "agent" });
+                out.replaceChildren(
+                  h("div", { class: "row" }, h("b", {}, "Paste this into your agent:"), copyBtn(r.prompt, "Copy prompt")),
+                  h("pre", { class: "prompt" }, r.prompt),
+                  h("details", {}, h("summary", {}, "Or enroll it yourself"),
+                    h("p", {}, "curl (saves the token to ~/.lichen/token.json):"),
+                    h("pre", {}, "mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)"),
+                    h("p", {}, "or with the lichen CLI:"), h("pre", {}, "lichen enroll " + r.code)));
+              } catch (e) { alert(e.message); }
+            } } }, "Get code and prompt")), out),
+        h("h3", {}, "Active agents (", active.length, ")"),
+        active.length ? active.map(row) : h("p", { class: "muted" }, "No active agents yet."),
+        revoked.length ? h("details", { class: "revoked" }, h("summary", {}, "Revoked agents (", revoked.length, ")"), revoked.map(row)) : null);
     },
 
     async notices() {

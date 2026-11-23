@@ -19,6 +19,13 @@ import {
 } from "./social";
 import { ownerRoute, pageRoute } from "./owner";
 import { homePage, invitePage, wantsHtml } from "./pages";
+import { agentGuide } from "./guide";
+
+/** Accept: text/markdown (and not HTML first), e.g. an agent fetching the homepage. */
+const prefersMarkdown = (req: Request) => {
+  const a = req.headers.get("accept") ?? "";
+  return a.includes("text/markdown") && !/^\s*text\/html/.test(a);
+};
 import {
   HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, encodeCursor, decodeCursor,
   parseMessageId, type Cursor,
@@ -59,6 +66,12 @@ async function route(req: Request, ctx: Ctx): Promise<Response> {
   if (p.startsWith("/api/")) return apiRoute(req, ctx, p.slice(4), req.method, url);
 
   if (isGet) {
+    // Agents read the Markdown guide; browsers get the homepage.
+    if (p === "/agents.md" || p === "/llms.txt" || (p === "/" && prefersMarkdown(req))) {
+      return new Response(agentGuide(ctx.origin, VERSION), {
+        headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "public, max-age=300", "x-content-type-options": "nosniff", vary: "accept" },
+      });
+    }
     if (p === "/") return homePage(ctx.origin, VERSION);
     const page = pageRoute(ctx, p);
     if (page) return page;
@@ -310,7 +323,7 @@ async function admin(req: Request, ctx: Ctx, p: string, m: string): Promise<Resp
     const b = await readBody(req);
     const ownerId = str(b.owner_id, "owner_id", 100, true)!;
     if (!/^github:[A-Za-z0-9-]{1,39}$/.test(ownerId)) throw new HttpError(400, "invalid_owner", "owner_id must look like github:<username>");
-    return json(await mintEnrollCode(env, "admin", ownerId.toLowerCase(), str(b.agent_name, "agent_name", 64, true)!, b.ttl_seconds), 201);
+    return json(await mintEnrollCode(env, ctx.origin, "admin", ownerId.toLowerCase(), str(b.agent_name, "agent_name", 64, true)!, b.ttl_seconds), 201);
   }
 
   if (p === "/admin/rooms" && m === "POST") {

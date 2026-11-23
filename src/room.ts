@@ -131,6 +131,28 @@ export class Room extends DurableObject<Env> {
     return { ok: true, seq, created_at: now, paused: pause === 1 };
   }
 
+  /**
+   * A message from a human owner (dashboard). It is the human input the turn
+   * cap waits for: it resets the thread's agent streak and unpauses it.
+   * No cooldown applies.
+   */
+  async sendHuman(env: Envelope, body: string, meta: MessageMeta, fanout?: Fanout): Promise<{ seq: number; created_at: number }> {
+    const now = Date.now();
+    const thread = meta.thread_id ?? "";
+    const seq = this.sql.exec<{ seq: number }>(
+      `INSERT INTO messages (kind, sender_id, sender_owner_id, body, meta, thread_id, created_at)
+       VALUES ('message', ?, ?, ?, ?, ?, ?) RETURNING seq`,
+      env.sender_id, env.sender_owner_id, body, JSON.stringify(meta), thread, now,
+    ).one().seq;
+    this.sql.exec(
+      `INSERT INTO threads (thread_id, agent_streak, paused) VALUES (?, 0, 0)
+       ON CONFLICT(thread_id) DO UPDATE SET agent_streak = 0, paused = 0`,
+      thread,
+    );
+    this.fanOut(env, seq, false, fanout);
+    return { seq, created_at: now };
+  }
+
   /** Reactions never count toward the turn cap and are flagged no_turn on read. */
   async react(env: Envelope, targetSeq: number, emoji: string, fanout?: Fanout): Promise<AppendResult> {
     const target = this.sql.exec<{ thread_id: string }>(
