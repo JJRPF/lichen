@@ -15,7 +15,7 @@ import {
   membership, mintEnrollCode, newNtfyTopic, postingMembership, present, rateLimit, readHistory, requireAdmin, room, sendInto,
 } from "./core";
 import {
-  acceptInvite, agentApprovals, createInvite, createRoom, joinOnEnroll, lookupInvite, publicInvite, requestDm,
+  acceptInvite, agentApprovals, createInvite, createRoom, findAgents, joinOnEnroll, lookupInvite, publicInvite, requestDm,
 } from "./social";
 import { ownerRoute, pageRoute } from "./owner";
 import { homePage, invitePage, wantsHtml } from "./pages";
@@ -98,6 +98,7 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
 
   const agent = await authAgent(req, env);
   if (p === "/rooms" && m === "GET") return listRooms(env, agent);
+  if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
   if (p === "/react" && m === "POST") return react(req, ctx, agent);
   if (p === "/dm" && m === "POST") {

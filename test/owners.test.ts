@@ -389,7 +389,7 @@ describe("homepage and /api layout", () => {
     expect(html).not.toContain("<script");
     expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
     const info = await SELF.fetch("https://lichen.test/api");
-    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.5.0" });
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.6.0" });
   });
 
   it("answers the old root API paths with 404, pointing at /api", async () => {
@@ -489,9 +489,91 @@ describe("enrolling agents with plain curl", () => {
       expect(md).toContain("# Lichen — setup guide for agents");
       expect(md).toContain("curl -s -X POST https://lichen.test/api/enroll -d code=<code>");
       expect(md).toContain("Tell your owner");
+      expect(md).toContain("`GET /api/agents?q=<name or github:owner>`");
+      expect(md).toContain("There is no global search.");
     }
     const html = await SELF.fetch("https://lichen.test/", { headers: { accept: "text/html,text/markdown;q=0.9" } });
     expect(html.headers.get("content-type")).toContain("text/html");
     expect(await html.text()).toContain('href="/agents.md"');
+  });
+});
+
+describe("chat sidebar data", () => {
+  it("returns each room's latest message and sorts rooms by activity", async () => {
+    const me = await owner("sidebar");
+    const b = await newAgent(me.id, "sidebar-b");
+    const quiet = await newRoom([me.agent.agent_id], "quiet");
+    const busy = await newRoom([me.agent.agent_id, b.agent_id], "busy");
+    await call("/send", { token: b.token, body: { room: busy, body: "Hello   **world**\nsecond line" } });
+    await call("/react", { token: me.agent.token, body: { message_id: `${busy}:1`, emoji: "👍" } });
+    const rooms = (await ownerCall("/owner/rooms", { jwt: me.jwt })).data.rooms;
+    expect(rooms.map((r: any) => r.id)).toEqual([busy, quiet]);
+    expect(rooms[0]).toMatchObject({ last_seq: 2, last: { sender_id: me.agent.agent_id, kind: "reaction", preview: "👍" } });
+    expect(rooms[1]).toMatchObject({ last_seq: 0, last: null });
+  });
+});
+
+describe("agent directory (GET /api/agents)", () => {
+  it("only finds agents in the owner's network, never strangers", async () => {
+    const A = await owner("dirA"); const B = await owner("dirB"); const C = await owner("dirC"); const D = await owner("dirD");
+    const a1 = A.agent, b1 = B.agent, c1 = C.agent, d1 = D.agent;
+    const a2 = await newAgent(A.id, "a2-helper");
+    await newRoom([a1.agent_id, b1.agent_id], "a1-b1");
+    await newRoom([b1.agent_id, c1.agent_id], "b1-c1");
+    const find = async (who: { token: string }, q = "") =>
+      (await call(`/agents${q ? `?q=${encodeURIComponent(q)}` : ""}`, { token: who.token })).data.agents as any[];
+
+    // a2: its sibling, plus b1 (met by its owner's other agent). Not c1 (two hops), not d1 (stranger).
+    const forA2 = await find(a2);
+    expect(forA2.map((x) => x.agent_id)).toEqual([a1.agent_id, b1.agent_id]);
+    expect(forA2[0]).toMatchObject({ relation: "same_owner", trust_tier: "same_owner", dm: "direct", shared_rooms: [] });
+    expect(forA2[1]).toMatchObject({ relation: "owner_network", trust_tier: "external", dm: "needs_owner_approval", shared_rooms: [] });
+
+    // a1 shares a room with b1: direct, and it sees that room.
+    const forA1 = await find(a1);
+    const b1Row = forA1.find((x) => x.agent_id === b1.agent_id);
+    expect(b1Row).toMatchObject({ relation: "shared_room", dm: "direct" });
+    expect(b1Row.shared_rooms.map((r: any) => r.name)).toEqual(["a1-b1"]);
+    expect(forA1.map((x) => x.agent_id)).not.toContain(c1.agent_id);
+
+    // b1 sees both sides it's been in a room with, but not A's other agent or D.
+    expect((await find(b1)).map((x) => x.agent_id).sort()).toEqual([a1.agent_id, c1.agent_id].sort());
+    expect((await find(d1))).toEqual([]);
+
+    // Search by name, owner or id; never widens the scope.
+    expect((await find(a2, "a2")).map((x) => x.agent_id)).toEqual([]);
+    expect((await find(a1, B.id)).map((x) => x.agent_id)).toEqual([b1.agent_id]);
+    expect((await find(a1, c1.agent_id))).toEqual([]);
+    expect((await find(a1, "%"))).toEqual([]);
+  });
+
+  it("hides agents whose owner blocked you, and revoked agents", async () => {
+    const A = await owner("blkA"); const B = await owner("blkB");
+    const a2 = await newAgent(A.id, "blk-a2");
+    await newRoom([A.agent.agent_id, B.agent.agent_id]);
+    const req = await call("/dm", { token: B.agent.token, body: { to: a2.agent_id, body: "hi" } });
+    await ownerCall(`/owner/approvals/${req.data.approval_id}`, { jwt: A.jwt, body: { action: "block" } });
+    const visible = (await call("/agents", { token: B.agent.token })).data.agents.map((x: any) => x.agent_id);
+    expect(visible).not.toContain(a2.agent_id);
+    expect(visible).not.toContain(A.agent.agent_id);
+    await ownerCall(`/owner/agents/${a2.agent_id}/revoke`, { jwt: A.jwt, body: {} });
+    expect((await call("/agents", { token: A.agent.token })).data.agents.map((x: any) => x.agent_id)).not.toContain(a2.agent_id);
+  });
+});
+
+describe("enrolling a new agent through an invite", () => {
+  it("returns the raw code, curl and a prompt that names the room", async () => {
+    const host = await owner("invhost"); const guest = await owner("invguest");
+    const roomId = await newRoom([host.agent.agent_id], "s2r-ingest");
+    const { code: inviteCode } = (await ownerCall("/owner/invites", { jwt: host.jwt, body: { room: roomId } })).data;
+    const r = (await ownerCall("/owner/invites/accept", { jwt: guest.jwt, body: { code: inviteCode, agent_name: "guest-bot" } })).data;
+    expect(r).toMatchObject({ status: "enroll", agent_name: "guest-bot", room: roomId });
+    expect(r.code).toBe(r.enroll_code);
+    expect(r.curl).toBe(`curl -s -X POST https://lichen.test/api/enroll -d code=${r.code}`);
+    expect(r.prompt).toContain(`code=${r.code}`);
+    expect(r.prompt).toContain('"s2r-ingest"');
+    expect(r.prompt).toContain('trust_tier "external"');
+    const enrolled = await call("/enroll", { body: { code: r.code } });
+    expect(enrolled.data).toMatchObject({ name: "guest-bot", joined_room: roomId });
   });
 });

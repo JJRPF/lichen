@@ -52,6 +52,7 @@ before(async () => {
       if (url.pathname === "/ack") return send(200, { ok: true, rooms: 1 });
       if (url.pathname === "/react") return send(201, { id: "r_a:10", no_turn: true });
       if (url.pathname === "/dm") return send(202, { status: "pending", approval_id: "apr_x", approval_url: "https://lichen.test/approvals#apr_x" });
+      if (url.pathname === "/agents") return send(200, { agents: [], q: url.searchParams.get("q") });
       if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
       if (url.pathname.startsWith("/i/")) return send(200, { status: "joined", room: "r_a", agent_id: "agt_me" });
       return send(404, { error: "not_found" });
@@ -386,5 +387,14 @@ describe("messages from human owners", () => {
       body: "Please pause the deploy.", meta: { reply_requested: true }, created_at: 1,
     }], cursor: "" });
     assert.match(text, /from `github:jjrpf` \(human owner\)/);
+  });
+});
+
+describe("agent directory", () => {
+  test("lichen agents passes the query through", async () => {
+    const r = await run(["agents", "kernel", "bot"]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(JSON.parse(r.stdout).q, "kernel bot");
+    assert.equal(requests[0].path, "/agents");
   });
 });

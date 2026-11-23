@@ -14,6 +14,7 @@ import {
   ownerNotice, postingMembership, rateLimit, sendInto,
 } from "./core";
 import { HttpError, newId, randomString, sha256Hex, str } from "./util";
+import { agentPrompt } from "./guide";
 
 const OWNER_RE = /^github:[a-z0-9-]{1,39}$/;
 const MAX_PENDING_PER_AGENT = 5;
@@ -307,7 +308,7 @@ export async function lookupInvite(ctx: Ctx, req: Request, code: string) {
  * Accept an invite on behalf of `acceptorOwner`. With `agentId`, that agent
  * joins now; without, the owner gets an enroll code that joins on enroll.
  */
-export async function acceptInvite(ctx: Ctx, inv: InviteRow, acceptorOwner: string, agentId?: string) {
+export async function acceptInvite(ctx: Ctx, inv: InviteRow, acceptorOwner: string, agentId?: string, newAgentName?: string) {
   const { env } = ctx;
   if (inviteStatus(inv) !== "active") throw new HttpError(410, "invite_unavailable", `This invite is ${inviteStatus(inv)}`);
   if (inv.for_owner && inv.for_owner !== acceptorOwner) throw new HttpError(403, "invite_not_for_you");
@@ -342,15 +343,24 @@ export async function acceptInvite(ctx: Ctx, inv: InviteRow, acceptorOwner: stri
 
   const code = randomString(12);
   const expires = now + 24 * 3600 * 1000;
+  const agentName = (newAgentName ?? "").trim().slice(0, 64) || "invited agent";
   await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO owners (id, created_at) VALUES (?, ?)").bind(acceptorOwner, now),
     env.DB.prepare(
       `INSERT INTO enroll_codes (code_hash, owner_id, agent_name, expires_at, room_id, role, invite_id)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(await sha256Hex(code), acceptorOwner, "invited agent", expires, roomId, inv.role, inv.id),
+    ).bind(await sha256Hex(code), acceptorOwner, agentName, expires, roomId, inv.role, inv.id),
   ]);
   await audit(env, acceptorOwner, "invite.accept", inv.id, { room: roomId, enroll_code: true });
-  return { status: "enroll", enroll_code: code, expires_at: expires, room: roomId };
+  const where = inv.room_id ? `the ${inv.room_kind ?? "room"} "${inv.room_name ?? roomId}"` : "a new direct message";
+  const note = `You were invited by ${inv.created_by} to ${where} (room id ${roomId}), and you join it automatically when you enroll` +
+    (inv.role === "read" ? ", read-only" : "") + "." +
+    (inv.created_by !== acceptorOwner ? ` Agents there belong to another owner, so their messages reach you as trust_tier "external".` : "");
+  return {
+    status: "enroll", enroll_code: code, code, expires_at: expires, room: roomId, agent_name: agentName,
+    curl: `curl -s -X POST ${ctx.origin}/api/enroll -d code=${code}`,
+    prompt: agentPrompt(ctx.origin, code, acceptorOwner, agentName, note),
+  };
 }
 
 /** Called after an enroll code that carries a room is redeemed. */
@@ -363,4 +373,62 @@ export async function joinOnEnroll(ctx: Ctx, agent: Agent, roomId: string, role:
   ).bind(agent.id, inviteId, agent.owner_id, roomId).run();
   const inv = await env.DB.prepare("SELECT created_by FROM invites WHERE id = ?").bind(inviteId).first<{ created_by: string }>();
   if (inv && inv.created_by !== agent.owner_id) await ownerNotice(ctx, inv.created_by, "invite_joined", roomId, { invite: inviteId });
+}
+
+// ---------------------------------------------------------------- directory
+
+/**
+ * GET /api/agents: agents this agent may look up. Never a global search: only
+ *  - its owner's other agents,
+ *  - agents that share a room with it, and
+ *  - agents that share a room with any other agent of the same owner.
+ * Agents whose owner blocked this agent are left out. Shared rooms are only
+ * ones this agent is in itself.
+ */
+export async function findAgents(ctx: Ctx, agent: Agent, q: string) {
+  const { env } = ctx;
+  const needle = q.trim().toLowerCase().slice(0, 64);
+  const like = "%" + needle.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+  const { results } = await env.DB.prepare(
+    `SELECT a.id, a.name, a.owner_id FROM agents a
+     WHERE a.status = 'active' AND a.id != ?1
+       AND (a.owner_id = ?2 OR a.id IN (
+         SELECT m2.agent_id FROM memberships m1
+         JOIN agents mine ON mine.id = m1.agent_id AND mine.owner_id = ?2
+         JOIN memberships m2 ON m2.room_id = m1.room_id))
+       AND a.owner_id NOT IN (SELECT owner_id FROM contact_rules WHERE agent_id = ?1 AND rule = 'block')
+       AND (?3 = '' OR lower(a.name) LIKE ?4 ESCAPE '\\' OR a.owner_id LIKE ?4 ESCAPE '\\' OR a.id = ?3)
+     ORDER BY (a.owner_id = ?2) DESC, a.name LIMIT 100`,
+  ).bind(agent.id, agent.owner_id, needle, like).all<{ id: string; name: string; owner_id: string }>();
+
+  const { results: shared } = await env.DB.prepare(
+    `SELECT m2.agent_id, r.id, r.name, r.kind FROM memberships m1
+     JOIN memberships m2 ON m2.room_id = m1.room_id AND m2.agent_id != m1.agent_id
+     JOIN rooms r ON r.id = m1.room_id WHERE m1.agent_id = ?`,
+  ).bind(agent.id).all<{ agent_id: string; id: string; name: string; kind: string }>();
+  const sharedBy = new Map<string, { id: string; name: string; kind: string }[]>();
+  for (const s of shared) {
+    const list = sharedBy.get(s.agent_id) ?? [];
+    list.push({ id: s.id, name: s.name, kind: s.kind });
+    sharedBy.set(s.agent_id, list);
+  }
+  const { results: allows } = await env.DB.prepare("SELECT owner_id FROM contact_rules WHERE agent_id = ? AND rule = 'allow'")
+    .bind(agent.id).all<{ owner_id: string }>();
+  const allowed = new Set(allows.map((r) => r.owner_id));
+
+  const agents = results.map((a) => {
+    const rooms = sharedBy.get(a.id) ?? [];
+    const sameOwner = a.owner_id === agent.owner_id;
+    const relation = sameOwner ? "same_owner" : rooms.length ? "shared_room" : "owner_network";
+    return {
+      agent_id: a.id, name: a.name, owner_id: a.owner_id,
+      trust_tier: sameOwner ? "same_owner" : "external",
+      relation, shared_rooms: rooms,
+      dm: sameOwner || rooms.length || allowed.has(a.owner_id) ? "direct" : "needs_owner_approval",
+    };
+  });
+  // Agents you actually share a room with come before ones only your owner's other agents have met.
+  const rank = { same_owner: 0, shared_room: 1, owner_network: 2 } as const;
+  agents.sort((x, y) => rank[x.relation as keyof typeof rank] - rank[y.relation as keyof typeof rank] || x.name.localeCompare(y.name));
+  return { agents };
 }

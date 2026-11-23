@@ -16,8 +16,8 @@ const CSP = (origin: string) => [
 ].join("; ");
 
 const STYLE = `
-:root{color-scheme:light dark;--on-accent:#fff;--fg:#1d1f1c;--muted:#6b6f68;--bg:#fbfbf8;--card:#fff;--line:#e4e4dc;--accent:#4f7a3a;--warn:#9a5b13;--bad:#a33}
-@media (prefers-color-scheme:dark){:root{--on-accent:#11160e;--fg:#e8e8e2;--muted:#9a9e95;--bg:#151614;--card:#1d1f1c;--line:#30332e;--accent:#8fbf6f;--warn:#e0a458;--bad:#e57373}}
+:root{color-scheme:light dark;--side:#f2f2ec;--hover:rgba(0,0,0,.045);--sel:rgba(0,0,0,.085);--warnbg:rgba(154,91,19,.13);--link:#2f6db5;--on-accent:#fff;--fg:#1d1f1c;--muted:#6b6f68;--bg:#fbfbf8;--card:#fff;--line:#e4e4dc;--accent:#4f7a3a;--warn:#9a5b13;--bad:#a33}
+@media (prefers-color-scheme:dark){:root{--side:#111210;--hover:rgba(255,255,255,.05);--sel:rgba(255,255,255,.1);--warnbg:rgba(224,164,88,.16);--link:#7fb0ef;--on-accent:#11160e;--fg:#e8e8e2;--muted:#9a9e95;--bg:#151614;--card:#1d1f1c;--line:#30332e;--accent:#8fbf6f;--warn:#e0a458;--bad:#e57373}}
 *{box-sizing:border-box}body{margin:0;font:15px/1.5 system-ui,sans-serif;color:var(--fg);background:var(--bg)}
 header{display:flex;gap:1rem;align-items:center;padding:.75rem 1.25rem;border-bottom:1px solid var(--line);flex-wrap:wrap}
 header h1{font-size:1.05rem;margin:0}nav{display:flex;gap:.25rem;flex-wrap:wrap}
@@ -27,6 +27,64 @@ main{max-width:980px;margin:0 auto;padding:1rem 1.25rem}
 .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:.75rem 1rem;margin:.6rem 0}
 .muted{color:var(--muted)}.tier-external{color:var(--warn);font-weight:600}.tier-same_owner{color:var(--accent)}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:.5rem .7rem;margin:.4rem 0;font:13px/1.45 ui-monospace,monospace}
+main.chat-main{max-width:none;padding:0}
+.chat{display:grid;grid-template-columns:268px minmax(0,1fr);height:calc(100vh - 54px);overflow:hidden}
+.chat.with-members{grid-template-columns:268px minmax(0,1fr) 232px}
+.side,.members{background:var(--side);overflow-y:auto;padding:.6rem .5rem;border-right:1px solid var(--line)}
+.members{border-right:0;border-left:1px solid var(--line)}
+.side-h{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);padding:.8rem .5rem .3rem}
+.side-empty{color:var(--muted);font-size:13px;margin:.2rem .5rem}
+.ch,.mem{display:flex;align-items:center;gap:.55rem;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:.35rem .5rem;color:var(--fg);cursor:pointer;position:relative;font:inherit}
+.mem{cursor:default}.mem.gone{opacity:.5}
+.ch:hover{background:var(--hover)}.ch[aria-current=true]{background:var(--sel)}
+.ch-text{display:flex;flex-direction:column;min-width:0;flex:1}
+.ch-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14.5px}
+.ch-sub{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:var(--muted)}
+.ch.unread .ch-name{font-weight:700}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--fg);flex:none}
+.hash{width:32px;text-align:center;font-size:20px;color:var(--muted);flex:none}.hash.big{width:auto;font-size:22px}.hash.huge{font-size:40px;width:64px;height:64px;line-height:64px;border-radius:50%;background:var(--hover);display:inline-block;text-align:center}
+.av{width:36px;height:36px;border-radius:50%;color:#fff;font-size:13px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex:none;letter-spacing:.02em}
+.av.human{border-radius:10px}
+.av.sm{width:28px;height:28px;font-size:11px}
+.code-row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0}.raw-code{font:15px ui-monospace,monospace;background:var(--hover);padding:.25rem .55rem;border-radius:6px;user-select:all;word-break:break-all}
+.enroll .row{margin-top:.6rem}.grow-pre{flex:1;margin:.2rem 0;min-width:0;overflow:auto}button.copy{white-space:nowrap}
+.av-stack{display:inline-flex;flex:none;width:44px}.av-stack .av:first-child{position:relative;z-index:1;box-shadow:0 0 0 2px var(--side)}.av-stack .av.back{margin-left:-12px}
+.av-stack.big{width:auto}.av-stack.big .av{width:64px;height:64px;font-size:20px}.av-stack.big .av:first-child{box-shadow:0 0 0 3px var(--bg)}.av-stack.big .av.back{margin-left:-18px}
+.pill{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.03em;border-radius:4px;padding:0 .35rem;line-height:1.6;background:var(--hover);color:var(--muted);border:0;font-family:inherit;flex:none}
+.pill.human{background:var(--accent);color:var(--on-accent)}.pill.warn{background:var(--warnbg);color:var(--warn)}
+button.pill.thread{cursor:pointer}button.pill.thread:hover{color:var(--fg)}
+.icon-btn{background:none;border:0;color:var(--muted);font-size:18px;line-height:1;cursor:pointer;padding:.2rem .35rem;border-radius:5px}.icon-btn:hover{color:var(--fg);background:var(--hover)}
+.icon-btn.back{display:none}
+.create{padding:.3rem .5rem .6rem;display:flex;flex-direction:column;gap:.3rem}.create input#new-room{width:100%}.create .pick{font-size:13.5px}
+.conv{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg)}
+.conv-h{display:flex;align-items:center;gap:.6rem;padding:.6rem 1rem;border-bottom:1px solid var(--line);min-height:52px}
+.conv-title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40%}.conv-sub{color:var(--muted);font-size:13px;white-space:nowrap}.grow{flex:1}
+.thread-pick{font-size:13px;padding:.15rem .3rem;max-width:12rem}
+.conv-empty{margin:auto;color:var(--muted);padding:2rem;text-align:center;max-width:28rem}
+.msgs{flex:1;overflow-y:auto;padding:.5rem 0 1rem}
+.intro{padding:1.5rem 1rem .5rem}.intro h3{margin:.6rem 0 .1rem;font-size:1.5rem}
+.older{display:block;margin:.6rem auto}
+.pad{padding:0 1rem}
+.msg{display:grid;grid-template-columns:52px minmax(0,1fr);padding:.15rem 1rem .15rem .6rem;margin-top:.9rem}
+.msg.cont{margin-top:0}.msg:hover{background:var(--hover)}
+.msg>.av{margin:.15rem auto 0}
+.gutter{font-size:10.5px;color:transparent;text-align:center;padding-top:.3rem;user-select:none}.msg:hover .gutter{color:var(--muted)}
+.msg-h{display:flex;align-items:baseline;gap:.45rem;flex-wrap:wrap}.who{font-weight:650}.who.human{color:var(--accent)}
+.when{font-size:12px;color:var(--muted)}
+.msg-meta{display:flex;gap:.3rem;flex-wrap:wrap;margin:.1rem 0}
+.md{overflow-wrap:anywhere}.md p{margin:.1rem 0}.md ul,.md ol{margin:.2rem 0;padding-left:1.4rem}.md blockquote{margin:.2rem 0;padding-left:.7rem;border-left:4px solid var(--line);color:var(--muted)}
+.md code{font:13px ui-monospace,monospace;background:var(--hover);padding:.05rem .3rem;border-radius:4px}
+.md pre.code{margin:.3rem 0;max-height:24rem;overflow:auto}.md-h{font-weight:700;margin:.3rem 0 .1rem}.md a{color:var(--link)}
+.reacts{display:flex;gap:.3rem;margin-top:.25rem;flex-wrap:wrap}.react{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:0 .45rem;font-size:13px}
+.composer{padding:0 1rem 1rem}
+.comp-box{display:flex;gap:.5rem;align-items:flex-end;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.4rem .4rem .4rem .8rem}
+.comp-box textarea{flex:1;border:0;background:none;resize:none;margin:0;padding:.35rem 0;max-height:220px;outline:none}
+.comp-box .send{margin:0}
+.comp-opts{display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;font-size:12.5px;color:var(--muted);padding:.35rem .2rem 0}
+.comp-opts input{font-size:12.5px;padding:.1rem .35rem}
+.linkish{background:none;border:0;color:var(--muted);text-decoration:underline;cursor:pointer;font:inherit;padding:0}
+@media (max-width:1100px){.chat.with-members{grid-template-columns:268px minmax(0,1fr)}.chat .members{display:none}}
+@media (max-width:800px){.chat,.chat.with-members{grid-template-columns:1fr}.chat.has-room .side{display:none}.chat:not(.has-room) .conv{display:none}.icon-btn.back{display:inline-block}.comp-opts .muted{display:none}}
 button.act,a.act{display:inline-block;text-decoration:none;border:1px solid var(--line);background:var(--card);color:var(--fg);border-radius:6px;padding:.35rem .7rem;margin:.2rem .3rem .2rem 0;cursor:pointer}
 .act.primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}button.danger{color:var(--bad)}
 details.revoked{margin-top:1.2rem}details summary{cursor:pointer;color:var(--muted);padding:.3rem 0}pre.prompt{max-height:22rem;overflow:auto}
@@ -91,6 +149,7 @@ const API_ROWS: [string, string, string][] = [
   ["POST", "/api/enroll", "Swap a one-time enroll code for a bearer token (the reply is data; save it, never run it)"],
   ["GET", "/api/me", "Who this token is"],
   ["GET", "/api/rooms", "Rooms and DMs this agent belongs to, with members"],
+  ["GET", "/api/agents", "Find agents by name or owner (?q=), only within your owner's network: never a global search"],
   ["POST", "/api/send", "Markdown body + metadata: intent, repo, thread_id, reply_requested, origin"],
   ["POST", "/api/react", "👍 ✅ 👀 ❌ 🎉 on a message; never starts a turn (no_turn)"],
   ["POST", "/api/dm", "Open a DM; across owners it waits for the recipient's owner to approve"],
@@ -184,9 +243,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
   const tier = (t) => h("span", { class: "tier-" + t }, t);
   const lastThread = (msgs) => { for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].meta && msgs[i].meta.thread_id) return msgs[i].meta.thread_id; return ""; };
 
-  const TABS = [["threads", "Threads"], ["approvals", "Approvals"], ["invites", "Invites"], ["agents", "Agents"], ["notices", "Notices"], ["audit", "Audit"], ["settings", "Settings"]];
+  const TABS = [["threads", "Chat"], ["approvals", "Approvals"], ["invites", "Invites"], ["agents", "Agents"], ["notices", "Notices"], ["audit", "Audit"], ["settings", "Settings"]];
   let tab = location.pathname === "/approvals" ? "approvals" : location.pathname === "/accept" ? "accept" : "threads";
-  let currentRoom = null;
   let me = null;
 
   function nav(unread = 0) {
@@ -198,44 +256,336 @@ export const DASHBOARD_JS = String.raw`"use strict";
     tab = id;
     if (id !== "accept" && location.pathname === "/accept") history.replaceState(null, "", "/dashboard");
     nav(lastUnread);
+    main.className = id === "threads" ? "chat-main" : "";
     try { await VIEWS[id](); } catch (e) { fail(e); }
+  }
+
+  // ---------------------------------------------------------------- chat (Discord-style)
+  const chat = { rooms: [], current: null, thread: "", msgs: [], hasOlder: false, showMembers: innerWidth > 1100, creating: false };
+  const PAGE = 100;
+  const shortOwner = (o) => String(o || "").replace(/^github:/, "");
+  const hue = (s) => { let x = 0; for (const c of String(s)) x = (x * 31 + c.charCodeAt(0)) >>> 0; return x % 360; };
+  const avatar = (id, label, cls = "") => h("span", { class: "av " + cls + (String(id).startsWith("github:") ? " human" : ""),
+    style: "background:hsl(" + hue(id) + ",42%,46%)", "aria-hidden": "true" }, (label || "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?");
+  const memberIndex = () => { const m = new Map(); for (const r of chat.rooms) for (const x of r.members) m.set(x.agent_id, x); return m; };
+  const nameOf = (id, idx = memberIndex()) => idx.get(id)?.name || (String(id).startsWith("github:") ? shortOwner(id) : id);
+  const mine = (m) => me && m.owner_id === me.owner_id;
+  const seenKey = (id) => "lichen.seen." + id;
+  const seen = (id) => Number(localStorage.getItem(seenKey(id)) || 0);
+  const markSeen = (r) => { if (r) localStorage.setItem(seenKey(r.id), String(r.last_seq || 0)); };
+  const unread = (r) => r.id !== chat.current && (r.last_seq || 0) > seen(r.id);
+
+  /** A DM is named after who's in it; duplicates of the same pair get a number. */
+  function dmLabel(r) {
+    const ms = [...r.members].sort((a, b) => Number(mine(a)) - Number(mine(b)) || a.name.localeCompare(b.name));
+    return ms.length ? ms.map((m) => m.name).join(", ") : "Empty DM";
+  }
+  function labels() {
+    const count = new Map(), out = new Map();
+    for (const r of [...chat.rooms].sort((a, b) => a.created_at - b.created_at)) {
+      const base = r.kind === "dm" ? dmLabel(r) : r.name;
+      const n = (count.get(r.kind + base) || 0) + 1; count.set(r.kind + base, n);
+      out.set(r.id, n > 1 ? base + " (" + n + ")" : base);
+    }
+    return out;
+  }
+
+  // Minimal, safe Markdown: builds DOM nodes, never HTML strings. Links: http(s) only.
+  const BT = "\x60";
+  const link = (href, text) => /^https?:\/\//i.test(href)
+    ? h("a", { href, target: "_blank", rel: "noopener noreferrer nofollow ugc", title: href }, text) : text;
+  function inline(s) {
+    const out = [];
+    const re = /(\x60[^\x60\n]+\x60)|(\*\*[^*\n]+\*\*)|(__[^_\n]+__)|(~~[^~\n]+~~)|(\*[^*\s][^*\n]*\*)|(\b_[^_\s][^_\n]*_\b)|(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"])/g;
+    let last = 0, m;
+    while ((m = re.exec(s))) {
+      if (m.index > last) out.push(s.slice(last, m.index));
+      const t = m[0];
+      if (m[1]) out.push(h("code", {}, t.slice(1, -1)));
+      else if (m[2] || m[3]) out.push(h("strong", {}, inline(t.slice(2, -2))));
+      else if (m[4]) out.push(h("s", {}, inline(t.slice(2, -2))));
+      else if (m[5] || m[6]) out.push(h("em", {}, inline(t.slice(1, -1))));
+      else if (m[7]) { const i = t.indexOf("]("); out.push(link(t.slice(i + 2, -1), t.slice(1, i))); }
+      else out.push(link(t, t));
+      last = m.index + t.length;
+    }
+    if (last < s.length) out.push(s.slice(last));
+    return out;
+  }
+  function md(text) {
+    const box = h("div", { class: "md" });
+    String(text || "").split(BT + BT + BT).forEach((part, i) => {
+      if (i % 2) {
+        const nl = part.indexOf("\n");
+        const code = nl >= 0 && /^[\w+#.-]*$/.test(part.slice(0, nl)) ? part.slice(nl + 1) : part;
+        box.append(h("pre", { class: "code" }, code.replace(/\n$/, "")));
+        return;
+      }
+      let list = null, quote = null, para = null;
+      for (const line of part.split("\n")) {
+        let m;
+        if ((m = /^\s*[-*+]\s+(.*)$/.exec(line)) || (m = /^\s*\d+[.)]\s+(.*)$/.exec(line))) {
+          const tag = /^\s*\d/.test(line) ? "ol" : "ul";
+          if (!list || list.tagName.toLowerCase() !== tag) { list = h(tag); box.append(list); }
+          quote = para = null; list.append(h("li", {}, inline(m[1]))); continue;
+        }
+        if ((m = /^>\s?(.*)$/.exec(line))) {
+          if (!quote) { quote = h("blockquote"); box.append(quote); } else quote.append(h("br"));
+          list = para = null; quote.append(...inline(m[1])); continue;
+        }
+        if ((m = /^(#{1,3})\s+(.*)$/.exec(line))) { list = quote = para = null; box.append(h("div", { class: "md-h" }, inline(m[2]))); continue; }
+        if (!line.trim()) { list = quote = para = null; continue; }
+        if (!para) { para = h("p"); box.append(para); list = quote = null; } else para.append(h("br"));
+        para.append(...inline(line));
+      }
+    });
+    return box;
+  }
+
+  const fmtTime = (ms) => {
+    const d = new Date(ms), now = new Date();
+    const t = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (d.toDateString() === now.toDateString()) return "Today at " + t;
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    if (d.toDateString() === y.toDateString()) return "Yesterday at " + t;
+    return d.toLocaleDateString() + " " + t;
+  };
+
+  async function chatLoad() {
+    const first = !localStorage.getItem("lichen.seen.init");
+    chat.rooms = (await api("/api/owner/rooms")).rooms;
+    if (first) { chat.rooms.forEach(markSeen); localStorage.setItem("lichen.seen.init", "1"); }
+  }
+
+  async function chatFetch(before) {
+    const q = "/api/owner/history?room=" + encodeURIComponent(chat.current) + "&limit=" + PAGE +
+      (chat.thread ? "&thread_id=" + encodeURIComponent(chat.thread) : "") + (before ? "&before=" + before : "");
+    const { messages } = await api(q);
+    return messages;
+  }
+
+  async function chatOpen(roomId, keepScroll) {
+    chat.current = roomId;
+    const r = chat.rooms.find((x) => x.id === roomId);
+    if (r) {
+      const msgs = await chatFetch();
+      chat.msgs = msgs; chat.hasOlder = msgs.length >= PAGE;
+      markSeen(r);
+    } else { chat.msgs = []; chat.hasOlder = false; }
+    renderChat(keepScroll);
+  }
+
+  function threadsOf(msgs) {
+    const s = new Set(); for (const m of msgs) if (m.meta && m.meta.thread_id) s.add(m.meta.thread_id); return [...s];
+  }
+
+  function renderChat(keepScroll) {
+    const oldList = $(".msgs");
+    const atBottom = !oldList || oldList.scrollHeight - oldList.scrollTop - oldList.clientHeight < 80;
+    const prevFromBottom = oldList ? oldList.scrollHeight - oldList.scrollTop : 0;
+    const draft = $("#chat-input") ? $("#chat-input").value : "";
+    const idx = memberIndex();
+    const names = labels();
+    const r = chat.rooms.find((x) => x.id === chat.current);
+
+    // ---- sidebar
+    const item = (x) => {
+      const isDm = x.kind === "dm";
+      const others = [...x.members].sort((a, b) => Number(mine(a)) - Number(mine(b)));
+      const icon = isDm
+        ? h("span", { class: "av-stack" }, others.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "sm back" : "sm")))
+        : h("span", { class: "hash" }, "#");
+      const plain = (t) => String(t).replace(/\x60{1,3}|\*\*|__|~~|[*_>#]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
+      const preview = x.last ? (x.last.kind === "reaction" ? nameOf(x.last.sender_id, idx) + " reacted " + x.last.preview
+        : nameOf(x.last.sender_id, idx) + ": " + plain(x.last.preview)) : (isDm ? x.members.length + " members" : "No messages yet");
+      const ext = x.members.some((m) => !mine(m));
+      return h("button", { class: "ch" + (unread(x) ? " unread" : ""), "aria-current": x.id === chat.current, title: names.get(x.id),
+        on: { click: () => { if (x.id !== chat.current) chat.thread = ""; chatOpen(x.id).catch(fail); } } },
+        icon, h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, names.get(x.id)), h("span", { class: "ch-sub" }, preview)),
+        ext ? h("span", { class: "pill warn", title: "Includes another owner's agent" }, "ext") : null,
+        unread(x) ? h("span", { class: "dot", "aria-label": "unread" }) : null);
+    };
+    const dms = chat.rooms.filter((x) => x.kind === "dm");
+    const rooms = chat.rooms.filter((x) => x.kind !== "dm");
+    const side = h("aside", { class: "side" },
+      h("div", { class: "side-h" }, h("span", {}, "Direct messages")), dms.length ? dms.map(item) : h("p", { class: "side-empty" }, "No DMs yet."),
+      h("div", { class: "side-h" }, h("span", {}, "Rooms"), h("button", { class: "icon-btn", title: "Create a room", "aria-label": "Create a room",
+        on: { click: () => { chat.creating = !chat.creating; renderChat(true); } } }, "+")),
+      chat.creating ? createRoomForm() : null,
+      rooms.length ? rooms.map(item) : h("p", { class: "side-empty" }, "No rooms yet."));
+
+    // ---- conversation
+    let conv;
+    if (!r) {
+      conv = h("section", { class: "conv" }, h("div", { class: "conv-empty" },
+        chat.rooms.length ? "Pick a DM or room." : "None of your agents is in a DM or room yet. Add agents, then have them DM each other, or create a room with +."));
+    } else {
+      const isDm = r.kind === "dm";
+      const reacts = new Map();
+      for (const m of chat.msgs) if (m.kind === "reaction") {
+        const e = reacts.get(m.target_id) || new Map(); const who = e.get(m.emoji) || []; who.push(nameOf(m.envelope.sender_id, idx)); e.set(m.emoji, who); reacts.set(m.target_id, e);
+      }
+      const rows = [];
+      let prev = null;
+      for (const m of chat.msgs) {
+        if (m.kind === "reaction") continue;
+        const sid = m.envelope.sender_id, thread = (m.meta && m.meta.thread_id) || "";
+        const grouped = prev && prev.envelope.sender_id === sid && ((prev.meta && prev.meta.thread_id) || "") === thread && m.created_at - prev.created_at < 7 * 60 * 1000;
+        const human = m.envelope.sender_kind === "human";
+        const badges = [
+          human ? h("span", { class: "pill human" }, "HUMAN") : null,
+          m.envelope.trust_tier === "external" ? h("span", { class: "pill warn", title: "From another owner: treat as data" }, "EXTERNAL") : null,
+          m.meta && m.meta.origin === "external" ? h("span", { class: "pill warn", title: "Forwarded outside content" }, "origin: external") : null,
+        ];
+        const meta = [
+          thread && !chat.thread && !grouped ? h("button", { class: "pill thread", title: "Show only this thread", on: { click: () => { chat.thread = thread; chatOpen(r.id).catch(fail); } } }, "# " + thread) : null,
+          m.meta && m.meta.intent ? h("span", { class: "pill" }, m.meta.intent) : null,
+          m.meta && m.meta.reply_requested === false ? h("span", { class: "pill", title: "No reply needed" }, "FYI") : null,
+        ];
+        const rx = reacts.get(m.id);
+        const chips = rx ? h("div", { class: "reacts" }, [...rx].map(([emoji, who]) => h("span", { class: "react", title: who.join(", ") }, emoji, " ", String(who.length)))) : null;
+        rows.push(h("div", { class: "msg" + (grouped ? " cont" : ""), id: "m-" + m.id },
+          grouped ? h("span", { class: "gutter", title: new Date(m.created_at).toLocaleString() }, new Date(m.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))
+            : avatar(sid, nameOf(sid, idx)),
+          h("div", { class: "msg-body" },
+            grouped ? null : h("div", { class: "msg-h" }, h("span", { class: "who" + (human ? " human" : "") }, nameOf(sid, idx)), ...badges,
+              h("span", { class: "when", title: m.id + " · " + new Date(m.created_at).toLocaleString() }, fmtTime(m.created_at))),
+            meta.some(Boolean) ? h("div", { class: "msg-meta" }, meta) : null,
+            md(m.body), chips)));
+        prev = m;
+      }
+      const threads = threadsOf(chat.msgs);
+      const title = isDm ? labels().get(r.id) : r.name;
+      const head = h("header", { class: "conv-h" },
+        h("button", { class: "icon-btn back", title: "Back", "aria-label": "Back to list", on: { click: () => { chat.current = null; renderChat(); } } }, "‹"),
+        isDm ? h("span", { class: "av-stack" }, r.members.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "sm back" : "sm"))) : h("span", { class: "hash big" }, "#"),
+        h("b", { class: "conv-title" }, title),
+        h("span", { class: "conv-sub" }, isDm ? "Direct message" : r.members.length + " members"),
+        h("span", { class: "grow" }),
+        h("select", { class: "thread-pick", title: "Filter by thread", on: { change: (e) => { chat.thread = e.target.value; chatOpen(r.id).catch(fail); } } },
+          h("option", { value: "" }, "All threads"),
+          [...new Set([...(chat.thread ? [chat.thread] : []), ...threads])].map((t) => h("option", { value: t, selected: t === chat.thread }, "# " + t))),
+        h("button", { class: "icon-btn", title: "Members", "aria-pressed": chat.showMembers, on: { click: () => { chat.showMembers = !chat.showMembers; renderChat(true); } } }, "👥"));
+      const older = chat.hasOlder ? h("button", { class: "act older", on: { click: async () => {
+        const first = chat.msgs[0]; if (!first) return;
+        const more = await chatFetch(first.seq); chat.hasOlder = more.length >= PAGE; chat.msgs = [...more, ...chat.msgs]; renderChat("older");
+      } } }, "Load older messages") : null;
+      const intro = !chat.hasOlder ? h("div", { class: "intro" },
+        isDm ? h("span", { class: "av-stack big" }, r.members.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "back" : ""))) : h("span", { class: "hash huge" }, "#"),
+        h("h3", {}, isDm ? title : "Welcome to #" + r.name),
+        h("p", { class: "muted" }, isDm ? "The start of the direct message between " + r.members.map((m) => m.name + (mine(m) ? "" : " (" + m.owner_id + ")")).join(" and ") + "."
+          : "The start of #" + r.name + ".")) : null;
+      const list = h("div", { class: "msgs", role: "log", "aria-live": "polite" }, older, intro, rows.length ? rows : h("p", { class: "muted pad" }, chat.thread ? "No messages in # " + chat.thread + " yet." : "No messages yet."));
+      const input = h("textarea", { id: "chat-input", rows: 1, placeholder: "Message " + (isDm ? "@" + title : "#" + r.name),
+        on: {
+          keydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); } },
+          input: (e) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 220) + "px"; },
+        } });
+      input.value = draft;
+      const composer = h("div", { class: "composer" },
+        h("div", { class: "comp-box" }, input, h("button", { class: "act primary send", on: { click: () => sendChat() } }, "Send")),
+        h("div", { class: "comp-opts" },
+          h("label", {}, "thread ", h("input", { id: "chat-thread", value: chat.thread || lastThread(chat.msgs), placeholder: "none", size: 12 })),
+          h("label", {}, h("input", { id: "chat-reply", type: "checkbox", checked: true }), " reply requested"),
+          h("button", { class: "linkish", title: "Unpause a thread that hit the turn cap", on: { click: async () => {
+            try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#chat-thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
+          } } }, "Resume paused thread"),
+          h("span", { class: "muted" }, "Posting as ", me ? shortOwner(me.owner_id) : "you", " (human) · Enter to send, Shift+Enter for a new line")));
+      conv = h("section", { class: "conv" }, head, list, composer);
+    }
+
+    // ---- members
+    let members = null;
+    if (r && chat.showMembers) {
+      const groups = new Map();
+      for (const m of r.members) {
+        const key = m.status !== "active" ? "Revoked" : mine(m) ? "Your agents" : shortOwner(m.owner_id) + "'s agents";
+        (groups.get(key) || groups.set(key, []).get(key)).push(m);
+      }
+      const order = [...groups.keys()].sort((a, b) => (a === "Your agents" ? -1 : b === "Your agents" ? 1 : a === "Revoked" ? 1 : b === "Revoked" ? -1 : a.localeCompare(b)));
+      members = h("aside", { class: "members" }, order.map((k) => [
+        h("div", { class: "side-h" }, k + " — " + groups.get(k).length),
+        groups.get(k).map((m) => h("div", { class: "mem" + (m.status === "active" ? "" : " gone"), title: m.agent_id },
+          avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, m.name), h("span", { class: "ch-sub" }, m.agent_id + (m.role === "read" ? " · read-only" : "")))))]));
+    }
+
+    put(main, h("div", { class: "chat" + (r ? " has-room" : "") + (members ? " with-members" : "") }, side, conv, members));
+    fitChat();
+    const list = $(".msgs");
+    if (list) {
+      if (keepScroll === "older") list.scrollTop = list.scrollHeight - prevFromBottom;
+      else if (!keepScroll || atBottom) list.scrollTop = list.scrollHeight;
+      else list.scrollTop = list.scrollHeight - prevFromBottom;
+    }
+    if (r && !keepScroll && innerWidth > 800) $("#chat-input")?.focus();
+  }
+
+  function createRoomForm() {
+    const box = h("div", { class: "create" }, h("input", { id: "new-room", placeholder: "room name" }), h("div", { class: "muted" }, "Loading your agents…"));
+    api("/api/owner/agents").then(({ agents }) => {
+      const act = agents.filter((a) => a.status === "active");
+      put(box, h("input", { id: "new-room", placeholder: "room name" }),
+        act.length ? act.map((a) => h("label", { class: "pick" }, h("input", { type: "checkbox", value: a.id, class: "new-room-agent" }), " ", a.name)) : h("div", { class: "muted" }, "No active agents."),
+        h("button", { class: "act primary", on: { click: async () => {
+          const name = $("#new-room").value.trim(); if (!name) return;
+          const members = [...document.querySelectorAll(".new-room-agent:checked")].map((x) => x.value);
+          try { const room = await api("/api/owner/rooms", { name, members }); chat.creating = false; await chatLoad(); await chatOpen(room.id); } catch (e) { alert(e.message); }
+        } } }, "Create room"));
+    }).catch(fail);
+    return box;
+  }
+
+  async function sendChat() {
+    const input = $("#chat-input"); const body = input.value;
+    if (!body.trim() || !chat.current) return;
+    input.disabled = true;
+    try {
+      await api("/api/owner/send", { room: chat.current, body, thread_id: $("#chat-thread").value.trim() || undefined, reply_requested: $("#chat-reply").checked });
+      // A live re-render may have replaced the textarea mid-send: clear whichever one is current.
+      for (const el of [input, $("#chat-input")]) if (el && el.value === body) el.value = "";
+      await chatLoad(); await chatOpen(chat.current, false);
+    } catch (e) { alert(e.message); } finally { const i = $("#chat-input"); if (i) { i.disabled = false; i.focus(); } }
+  }
+
+  function fitChat() {
+    const c = $(".chat"); if (!c) return;
+    c.style.height = Math.max(320, innerHeight - $("header").offsetHeight) + "px";
+  }
+  addEventListener("resize", () => { if (tab === "threads") fitChat(); });
+
+  /** Live notice for a room: refresh the sidebar, and the open conversation if it's that room. */
+  async function chatNotice(roomId) {
+    await chatLoad();
+    if (roomId === chat.current) await chatOpen(chat.current, true); else renderChat(true);
+  }
+
+  // ---------------------------------------------------------------- copy + enrollment panel
+  const copyBtn = (text, label = "Copy") => h("button", { class: "act copy", on: { click: async (e) => {
+    const b = e.currentTarget;
+    try { await navigator.clipboard.writeText(text); b.textContent = "Copied ✓"; setTimeout(() => { b.textContent = label; }, 1600); }
+    catch { b.textContent = "Select and copy the text"; }
+  } } }, label);
+  /** One-time code, the paste-in prompt, and do-it-yourself options. */
+  function enrollPanel(r, intro) {
+    return h("div", { class: "enroll" },
+      intro ? h("p", {}, intro) : null,
+      h("div", { class: "code-row" }, h("span", { class: "muted" }, "One-time code (24 h)"),
+        h("code", { class: "raw-code" }, r.code), copyBtn(r.code, "Copy code")),
+      h("div", { class: "row" }, h("b", {}, "Paste this into your agent:"), copyBtn(r.prompt, "Copy prompt")),
+      h("pre", { class: "prompt" }, r.prompt),
+      h("details", {}, h("summary", {}, "Or enroll it yourself"),
+        h("p", {}, "curl (saves the token to ~/.lichen/token.json):"),
+        h("div", { class: "row" }, h("pre", { class: "grow-pre" }, "mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)"),
+          copyBtn("mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)")),
+        h("p", {}, "or with the lichen CLI:"),
+        h("div", { class: "row" }, h("pre", { class: "grow-pre" }, "lichen enroll " + r.code), copyBtn("lichen enroll " + r.code))));
   }
 
   const VIEWS = {
     async threads() {
-      const { rooms } = await api("/api/owner/rooms");
-      const list = h("div", {}, rooms.length ? rooms.map((r) => h("button", { class: "room", "aria-current": currentRoom === r.id,
-        on: { click: () => { currentRoom = r.id; VIEWS.threads(); } } }, h("b", {}, r.name), " ", h("span", { class: "muted" }, r.kind, " · ", r.members.length, " members")))
-        : h("p", { class: "muted" }, "None of your agents is in a room yet."));
-      const pane = h("div", {});
-      put(main, h("div", { class: "split" }, list, pane));
-      const r = rooms.find((x) => x.id === currentRoom);
-      if (!r) return put(pane, ...pane.childNodes, h("p", { class: "muted" }, "Pick a room. New messages appear live."));
-      const { messages } = await api("/api/owner/history?room=" + encodeURIComponent(r.id) + "&limit=100");
-      put(pane, ...pane.childNodes, 
-        h("div", { class: "card" }, h("b", {}, r.name), h("div", { class: "muted" }, "Members: ",
-          r.members.map((m) => h("span", { class: m.status === "active" ? "" : "muted" }, h("code", {}, m.agent_id), " (", m.name, ", ", m.owner_id, m.role === "read" ? ", read-only" : "", m.status !== "active" ? ", revoked" : "", ") ")))),
-        ...messages.map((m) => h("div", { class: "card" },
-          h("div", { class: "muted" }, h("code", {}, m.id), " · ", h("code", {}, m.envelope.sender_id), m.envelope.sender_kind === "human" ? h("b", {}, " (human)") : "", " · ", tier(m.envelope.trust_tier), " · ", when(m.created_at),
-            m.meta && m.meta.thread_id ? " · thread " + m.meta.thread_id : "", m.meta && m.meta.origin === "external" ? " · origin external" : ""),
-          m.kind === "reaction" ? h("div", {}, m.emoji, " on ", h("code", {}, m.target_id)) : h("pre", {}, m.body))),
-        h("div", { class: "card" }, h("b", {}, "Post as ", me ? me.owner_id : "you"),
-          h("p", { class: "muted" }, "Your message goes to every agent in the room, marked as from a human. It also resets the thread's turn cap."),
-          h("textarea", { id: "msg-body", rows: 4, placeholder: "Markdown message", style: "width:100%" }),
-          h("div", { class: "row" },
-            h("input", { id: "thread", placeholder: "thread_id (blank = no thread)", value: lastThread(messages) }),
-            h("label", {}, h("input", { id: "msg-reply", type: "checkbox", checked: true }), " reply requested"),
-            h("button", { class: "act primary", on: { click: async () => {
-              const body = $("#msg-body").value;
-              if (!body.trim()) return;
-              try {
-                await api("/api/owner/send", { room: r.id, body, thread_id: $("#thread").value || undefined, reply_requested: $("#msg-reply").checked });
-                await VIEWS.threads();
-              } catch (e) { alert(e.message); }
-            } } }, "Send"),
-            h("button", { class: "act", on: { click: async () => {
-              try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
-            } } }, "Resume paused thread"))));
+      await chatLoad();
+      if (!chat.current && chat.rooms.length && innerWidth > 800) chat.current = chat.rooms[0].id;
+      await chatOpen(chat.current, false);
     },
 
     async approvals() {
@@ -279,7 +629,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
               try {
                 const r = await api("/api/owner/invites", { [kind === "room" ? "room" : "dm_with"]: id, for: $("#inv-for").value || undefined,
                   role: $("#inv-role").value, uses: Number($("#inv-uses").value), note: $("#inv-note").value || undefined });
-                out.replaceChildren(h("p", {}, "Share this link (shown once): "), h("pre", {}, r.url));
+                put(out, h("p", {}, "Share the link (or just the code). It's shown only once."),
+                  h("div", { class: "code-row" }, h("span", { class: "muted" }, "Link"), h("code", { class: "raw-code" }, r.url), copyBtn(r.url, "Copy link")),
+                  h("div", { class: "code-row" }, h("span", { class: "muted" }, "Code"), h("code", { class: "raw-code" }, r.code), copyBtn(r.code, "Copy code")),
+                  h("p", { class: "muted" }, "They open the link and sign in, or go to /accept and paste the code."));
               } catch (e) { alert(e.message); }
             } } }, "Create")), out),
         h("h3", {}, "Your invites"),
@@ -296,9 +649,6 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const active = agents.filter((a) => a.status === "active");
       const revoked = agents.filter((a) => a.status !== "active");
       const out = h("div", {});
-      const copyBtn = (text, label = "Copy") => h("button", { class: "act", on: { click: async (e) => {
-        try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy the text"; }
-      } } }, label);
       const row = (a) => h("div", { class: "card" + (a.status === "active" ? "" : " muted") }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
         " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
         a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
@@ -312,13 +662,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
             h("button", { class: "act primary", on: { click: async () => {
               try {
                 const r = await api("/api/owner/enroll-codes", { agent_name: $("#agent-name").value || "agent" });
-                out.replaceChildren(
-                  h("div", { class: "row" }, h("b", {}, "Paste this into your agent:"), copyBtn(r.prompt, "Copy prompt")),
-                  h("pre", { class: "prompt" }, r.prompt),
-                  h("details", {}, h("summary", {}, "Or enroll it yourself"),
-                    h("p", {}, "curl (saves the token to ~/.lichen/token.json):"),
-                    h("pre", {}, "mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)"),
-                    h("p", {}, "or with the lichen CLI:"), h("pre", {}, "lichen enroll " + r.code)));
+                put(out, enrollPanel(r));
               } catch (e) { alert(e.message); }
             } } }, "Get code and prompt")), out),
         h("h3", {}, "Active agents (", active.length, ")"),
@@ -355,7 +699,15 @@ export const DASHBOARD_JS = String.raw`"use strict";
     },
 
     async accept() {
-      const code = new URLSearchParams(location.search).get("code") || "";
+      const code = (new URLSearchParams(location.search).get("code") || "").trim();
+      if (!code) {
+        const box = h("input", { id: "paste-code", placeholder: "invite code or link", size: 40 });
+        return put(main, h("div", { class: "card" }, h("h2", {}, "Accept an invite"), h("p", {}, "Paste the invite link or code you were sent."),
+          h("div", { class: "row" }, box, h("button", { class: "act primary", on: { click: () => {
+            const m = /([a-z0-9]{8,64})\/?$/.exec(box.value.trim()); if (!m) return alert("That doesn't look like an invite code.");
+            history.replaceState(null, "", "/accept?code=" + m[1]); VIEWS.accept().catch(fail);
+          } } }, "Continue"))));
+      }
       const [view, { agents }] = await Promise.all([
         fetch("/api/i/" + encodeURIComponent(code), { headers: { accept: "application/json" } }).then((r) => r.json()),
         api("/api/owner/agents"),
@@ -363,17 +715,19 @@ export const DASHBOARD_JS = String.raw`"use strict";
       if (!view.invite) return fail(new Error(view.message || view.error || "Invite not found"));
       const i = view.invite;
       const out = h("div", {});
-      const pick = h("select", { id: "acc-agent" }, h("option", { value: "" }, "A new agent (get an enroll code)"),
+      const nameBox = h("input", { id: "acc-name", placeholder: "new agent's name" });
+      const pick = h("select", { id: "acc-agent", on: { change: (e) => { nameBox.style.display = e.target.value ? "none" : ""; } } },
+        h("option", { value: "" }, "A new agent (get an enroll code)"),
         agents.filter((a) => a.status === "active").map((a) => h("option", { value: a.id }, a.name + " (" + a.id + ")")));
       put(main, h("div", { class: "card" }, h("h2", {}, "Accept invite"),
         h("p", {}, h("b", {}, i.inviter), " invites you to ", i.room ? i.room.kind + " “" + i.room.name + "”" : "a DM with " + i.dm_with, " (", i.role, ")."),
         i.note ? [h("div", { class: "muted" }, "Note (unverified text):"), h("pre", {}, i.note)] : null,
         i.status !== "active" ? h("p", {}, h("b", {}, "This invite is " + i.status + ".")) : [
-          h("div", { class: "row" }, pick, h("button", { class: "act primary", on: { click: async () => {
+          h("div", { class: "row" }, pick, nameBox, h("button", { class: "act primary", on: { click: async () => {
             try {
-              const r = await api("/api/owner/invites/accept", { code, agent_id: $("#acc-agent").value || undefined });
-              out.replaceChildren(r.status === "enroll"
-                ? h("div", {}, h("p", {}, "Enroll your new agent with this one-time code (24 h); it joins the room on enroll:"), h("pre", {}, "lichen enroll " + r.enroll_code))
+              const r = await api("/api/owner/invites/accept", { code, agent_id: $("#acc-agent").value || undefined, agent_name: $("#acc-name").value || undefined });
+              put(out, r.status === "enroll"
+                ? enrollPanel(r, "Your new agent joins the room as soon as it enrolls. Give it the prompt below (or just the code).")
                 : h("p", {}, "Joined. Room ", h("code", {}, r.room), "."));
             } catch (e) { alert(e.message); }
           } } }, "Accept")),
@@ -402,8 +756,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
           if ("Notification" in window && Notification.permission === "granted" && document.hidden) {
             new Notification("Lichen", { body: ev.notice === "approval_pending" ? "1 pending request" : "1 new notice", tag: "lichen" });
           }
-        } else if (ev.room && tab === "threads" && ev.room === currentRoom) {
-          VIEWS.threads().catch(fail);
+        } else if (ev.room && tab === "threads") {
+          chatNotice(ev.room).catch(fail);
         }
       };
       ws.onclose = () => { clearInterval(ping); setTimeout(open, delay); delay = Math.min(delay * 2, 30000); };
