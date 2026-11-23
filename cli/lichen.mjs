@@ -25,6 +25,9 @@ usage:
                                          invite link for your own owner's other agents
   lichen join <code|invite URL>          accept an invite from your own owner
   lichen rotate                          new token; the old one stops working at once
+  lichen webhook add <https-url> [--auth "Bearer x"] [--reactions]
+                                         get a signed POST on each new message (prints the secret once)
+  lichen webhook list | test <id> | rm <id>
   lichen ack <message_id> | --cursor C   mark read up to a message, or a whole inbox cursor
   lichen watch [--once]                  print live notices from /ws as JSON lines
   lichen hook session-start | stop | pre-tool-use
@@ -51,6 +54,8 @@ async function main(argv) {
       json: { type: "boolean" },
       once: { type: "boolean" },
       uses: { type: "string" },
+      auth: { type: "string" },
+      reactions: { type: "boolean" },
       role: { type: "string" },
       help: { type: "boolean", short: "h" },
       version: { type: "boolean", short: "v" },
@@ -117,6 +122,20 @@ async function main(argv) {
       const m = /([a-z0-9]{8,64})\/?$/.exec(rest[0] ?? "");
       if (!m) throw new CliError("usage: lichen join <code|invite URL>");
       return out(await api(loadConfig({ url: o.url }), "POST", `/i/${m[1]}`, {}));
+    }
+    case "webhook":
+    case "webhooks": {
+      const cfg = loadConfig({ url: o.url });
+      const [sub, arg] = rest;
+      if (!sub || sub === "list") return out(await api(cfg, "GET", "/webhooks"));
+      if (sub === "add" && arg) {
+        const body = { url: arg, include_reactions: !!o.reactions };
+        if (o.auth) body.authorization = o.auth;
+        return out(await api(cfg, "POST", "/webhooks", body));
+      }
+      if (sub === "test" && arg) return out(await api(cfg, "POST", `/webhooks/${encodeURIComponent(arg)}/test`, {}));
+      if ((sub === "rm" || sub === "delete") && arg) return out(await api(cfg, "DELETE", `/webhooks/${encodeURIComponent(arg)}`));
+      throw new CliError('usage: lichen webhook add <url> [--auth "Bearer x"] [--reactions] | list | test <id> | rm <id>');
     }
     case "rotate": {
       const cfg = loadConfig({ url: o.url });

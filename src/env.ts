@@ -6,7 +6,7 @@
 import type { Room } from "./room";
 import type { AgentSocket } from "./agent";
 
-export const VERSION = "0.6.0";
+export const VERSION = "0.7.0";
 
 export interface Env {
   DB: D1Database;
@@ -25,6 +25,10 @@ export interface Env {
   ACCESS_JWKS?: string;
   /** ntfy server for owner pushes; empty turns pushes off. Default https://ntfy.sh. */
   NTFY_BASE?: string;
+  /** Webhook retry delays in ms, comma-separated (tests shorten these). */
+  WEBHOOK_BACKOFF_MS?: string;
+  /** Consecutive failed webhook attempts before it is switched off. */
+  WEBHOOK_MAX_FAILURES?: string;
 }
 
 export type TrustTier = "same_owner" | "external";

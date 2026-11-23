@@ -26,8 +26,9 @@ const prefersMarkdown = (req: Request) => {
   const a = req.headers.get("accept") ?? "";
   return a.includes("text/markdown") && !/^\s*text\/html/.test(a);
 };
+import { checkWebhookUrl } from "./webhooks";
 import {
-  HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, encodeCursor, decodeCursor,
+  HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, bool, encodeCursor, decodeCursor,
   parseMessageId, type Cursor,
 } from "./util";
 
@@ -111,6 +112,19 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
   if (p === "/ack" && m === "POST") return ack(req, env, agent);
   if (p === "/ws" && m === "GET") return connect(req, env, agent.id);
   if (p === "/rotate" && m === "POST") return rotate(env, agent);
+  if (p === "/webhooks" && m === "POST") return addWebhook(req, ctx, agent);
+  if (p === "/webhooks" && m === "GET") return json({ webhooks: await agentHub(env, agent.id).listWebhooks() });
+  const wh = /^\/webhooks\/(whk_[a-z0-9]+)(\/test|\/delete)?$/.exec(p);
+  if (wh && ((m === "DELETE" && !wh[2]) || (m === "POST" && wh[2] === "/delete"))) {
+    if (!(await agentHub(env, agent.id).deleteWebhook(wh[1]))) throw new HttpError(404, "webhook_not_found");
+    await audit(env, agent.id, "webhook.delete", wh[1]);
+    return json({ ok: true, id: wh[1], deleted: true });
+  }
+  if (wh && m === "POST" && wh[2] === "/test") {
+    const r = await agentHub(env, agent.id).testWebhook(wh[1]);
+    if (!r) throw new HttpError(404, "webhook_not_found");
+    return json({ id: wh[1], ...r });
+  }
   if (p === "/me" && m === "GET") return json({ agent_id: agent.id, owner_id: agent.owner_id, name: agent.name });
 
   throw new HttpError(404, "not_found");
@@ -167,6 +181,30 @@ async function rotate(env: Env, agent: Agent): Promise<Response> {
   await agentHub(env, agent.id).closeAll(CLOSE_ROTATED, "token rotated");
   await audit(env, agent.id, "token.rotate", agent.id);
   return json({ agent_id: agent.id, token, rotated_at: now });
+}
+
+// ---------------------------------------------------------------- webhooks
+
+/**
+ * POST /api/webhooks {url, authorization?, include_reactions?}: wake this
+ * agent by webhook on new messages. The signing secret is returned once.
+ */
+async function addWebhook(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
+  const b = await readBody(req);
+  const url = checkWebhookUrl(b.url, ctx.origin);
+  const authorization = str(b.authorization, "authorization", 1024);
+  if (authorization !== undefined && (/[\r\n]/.test(authorization) || !/^\S+ \S/.test(authorization))) {
+    throw new HttpError(400, "invalid_field", 'authorization must look like "Bearer <token>"');
+  }
+  const r = await agentHub(ctx.env, agent.id).addWebhook({
+    agentId: agent.id, origin: ctx.origin, url, authorization, includeReactions: bool(b.include_reactions, "include_reactions", false),
+  });
+  if ("error" in r) throw new HttpError(409, r.error!, r.message);
+  await audit(ctx.env, agent.id, "webhook.create", r.webhook.id, { host: new URL(url).hostname, reactions: r.webhook.include_reactions });
+  return json({
+    ...r.webhook,
+    note: "Save the secret now; it isn't shown again. Verify each delivery's webhook-signature with it (Standard Webhooks).",
+  }, 201);
 }
 
 // ---------------------------------------------------------------- rooms / send / react
@@ -370,6 +408,7 @@ async function admin(req: Request, ctx: Ctx, p: string, m: string): Promise<Resp
     const res = await env.DB.prepare("UPDATE agents SET status = 'revoked' WHERE id = ?").bind(mm[1]).run();
     if (!res.meta.changes) throw new HttpError(404, "not_found");
     await agentHub(env, mm[1]).closeAll();
+    await agentHub(env, mm[1]).deleteAllWebhooks();
     await audit(env, "admin", "agent.revoke", mm[1]);
     return json({ ok: true, agent_id: mm[1], status: "revoked" });
   }

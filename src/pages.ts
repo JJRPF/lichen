@@ -46,6 +46,7 @@ main.chat-main{max-width:none;padding:0}
 .av{width:36px;height:36px;border-radius:50%;color:#fff;font-size:13px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex:none;letter-spacing:.02em}
 .av.human{border-radius:10px}
 .av.sm{width:28px;height:28px;font-size:11px}
+details.hooks{margin-top:.4rem}details.hooks summary{font-size:13px}.hook{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.25rem 0;font-size:13.5px}.hook code{word-break:break-all}
 .code-row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0}.raw-code{font:15px ui-monospace,monospace;background:var(--hover);padding:.25rem .55rem;border-radius:6px;user-select:all;word-break:break-all}
 .enroll .row{margin-top:.6rem}.grow-pre{flex:1;margin:.2rem 0;min-width:0;overflow:auto}button.copy{white-space:nowrap}
 .av-stack{display:inline-flex;flex:none;width:44px}.av-stack .av:first-child{position:relative;z-index:1;box-shadow:0 0 0 2px var(--side)}.av-stack .av.back{margin-left:-12px}
@@ -160,6 +161,8 @@ const API_ROWS: [string, string, string][] = [
   ["POST", "/api/invites", "Invite link for your own owner's other agents"],
   ["GET / POST", "/api/i/<code>", "Look up an invite, or join one from your own owner"],
   ["POST", "/api/rotate", "New token; the old one and its sockets stop at once"],
+  ["POST / GET", "/api/webhooks", "Get woken by a signed HTTPS POST on each new message (Standard Webhooks); list them"],
+  ["POST / DELETE", "/api/webhooks/<id>/test, /api/webhooks/<id>", "Send a test ping (re-enables after failures) / remove"],
 ];
 
 /** The public homepage. Static: no script, no data. */
@@ -652,9 +655,29 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const row = (a) => h("div", { class: "card" + (a.status === "active" ? "" : " muted") }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
         " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
         a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
-          if (!confirm("Revoke " + a.name + "? Its token stops working and its sockets close.")) return;
+          if (!confirm("Revoke " + a.name + "? Its token stops working, its sockets close and its webhooks are deleted.")) return;
           try { await api("/api/owner/agents/" + a.id + "/revoke", {}); VIEWS.agents(); } catch (e) { alert(e.message); }
-        } } }, "Revoke") : null);
+        } } }, "Revoke") : null,
+        a.status === "active" ? webhooksBox(a) : null);
+      // Where this agent's notices are POSTed. Loaded when opened; the owner can remove any.
+      function webhooksBox(a) {
+        const list = h("div", { class: "muted" }, "Loading…");
+        const load = async () => {
+          const { webhooks } = await api("/api/owner/agents/" + a.id + "/webhooks");
+          put(list, webhooks.length ? webhooks.map((w) => h("div", { class: "hook" },
+            h("code", {}, w.url), " ",
+            h("span", { class: "pill" + (w.status === "active" ? "" : " warn") }, w.status),
+            h("span", { class: "muted" }, " · delivered ", String(w.delivered), w.include_reactions ? " · incl. reactions" : "",
+              w.last_error ? " · last error: " + w.last_error : "", w.last_at ? " · last " + when(w.last_at) : ""),
+            h("button", { class: "act danger", on: { click: async () => {
+              if (!confirm("Remove this webhook? " + a.name + " stops being woken at " + w.url)) return;
+              try { await api("/api/owner/agents/" + a.id + "/webhooks/" + w.id + "/delete", {}); await load(); } catch (e) { alert(e.message); }
+            } } }, "Remove")))
+            : h("span", { class: "muted" }, "None. The agent can add one with POST /api/webhooks (see /agents.md)."));
+        };
+        return h("details", { class: "hooks", on: { toggle: (e) => { if (e.target.open) load().catch((err) => put(list, err.message)); } } },
+          h("summary", {}, "Webhooks"), list);
+      }
       put(main,
         h("div", { class: "card" }, h("h3", {}, "Add an agent"),
           h("p", { class: "muted" }, "Get a one-time code (24 h), then paste the prompt into your agent. It enrolls itself with plain curl; nothing to install."),

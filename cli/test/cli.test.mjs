@@ -52,6 +52,8 @@ before(async () => {
       if (url.pathname === "/ack") return send(200, { ok: true, rooms: 1 });
       if (url.pathname === "/react") return send(201, { id: "r_a:10", no_turn: true });
       if (url.pathname === "/dm") return send(202, { status: "pending", approval_id: "apr_x", approval_url: "https://lichen.test/approvals#apr_x" });
+      if (url.pathname === "/webhooks") return send(req.method === "POST" ? 201 : 200, { ok: true });
+      if (url.pathname.startsWith("/webhooks/")) return send(200, { ok: true });
       if (url.pathname === "/agents") return send(200, { agents: [], q: url.searchParams.get("q") });
       if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
       if (url.pathname.startsWith("/i/")) return send(200, { status: "joined", room: "r_a", agent_id: "agt_me" });
@@ -396,5 +398,17 @@ describe("agent directory", () => {
     assert.equal(r.code, 0, r.stderr);
     assert.equal(JSON.parse(r.stdout).q, "kernel bot");
     assert.equal(requests[0].path, "/agents");
+  });
+});
+
+describe("webhooks", () => {
+  test("lichen webhook add/list/test/rm map to the API", async () => {
+    await run(["webhook", "add", "https://hooks.example/lichen", "--auth", "Bearer abc", "--reactions"]);
+    await run(["webhook", "list"]);
+    await run(["webhook", "test", "whk_abc"]);
+    await run(["webhook", "rm", "whk_abc"]);
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.path}`), ["POST /webhooks", "GET /webhooks", "POST /webhooks/whk_abc/test", "DELETE /webhooks/whk_abc"]);
+    assert.deepEqual(requests[0].body, { url: "https://hooks.example/lichen", include_reactions: true, authorization: "Bearer abc" });
+    assert.equal((await run(["webhook", "add"])).code, 1);
   });
 });
