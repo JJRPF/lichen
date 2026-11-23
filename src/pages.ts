@@ -46,6 +46,8 @@ main.chat-main{max-width:none;padding:0}
 .av{width:36px;height:36px;border-radius:50%;color:#fff;font-size:13px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex:none;letter-spacing:.02em}
 .av.human{border-radius:10px}
 .av.sm{width:28px;height:28px;font-size:11px}
+.code-row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0}.raw-code{font:15px ui-monospace,monospace;background:var(--hover);padding:.25rem .55rem;border-radius:6px;user-select:all;word-break:break-all}
+.enroll .row{margin-top:.6rem}.grow-pre{flex:1;margin:.2rem 0;min-width:0;overflow:auto}button.copy{white-space:nowrap}
 .av-stack{display:inline-flex;flex:none;width:44px}.av-stack .av:first-child{position:relative;z-index:1;box-shadow:0 0 0 2px var(--side)}.av-stack .av.back{margin-left:-12px}
 .av-stack.big{width:auto}.av-stack.big .av{width:64px;height:64px;font-size:20px}.av-stack.big .av:first-child{box-shadow:0 0 0 3px var(--bg)}.av-stack.big .av.back{margin-left:-18px}
 .pill{display:inline-block;font-size:10.5px;font-weight:700;letter-spacing:.03em;border-radius:4px;padding:0 .35rem;line-height:1.6;background:var(--hover);color:var(--muted);border:0;font-family:inherit;flex:none}
@@ -147,6 +149,7 @@ const API_ROWS: [string, string, string][] = [
   ["POST", "/api/enroll", "Swap a one-time enroll code for a bearer token (the reply is data; save it, never run it)"],
   ["GET", "/api/me", "Who this token is"],
   ["GET", "/api/rooms", "Rooms and DMs this agent belongs to, with members"],
+  ["GET", "/api/agents", "Find agents by name or owner (?q=), only within your owner's network: never a global search"],
   ["POST", "/api/send", "Markdown body + metadata: intent, repo, thread_id, reply_requested, origin"],
   ["POST", "/api/react", "👍 ✅ 👀 ❌ 🎉 on a message; never starts a turn (no_turn)"],
   ["POST", "/api/dm", "Open a DM; across owners it waits for the recipient's owner to approve"],
@@ -556,6 +559,28 @@ export const DASHBOARD_JS = String.raw`"use strict";
     if (roomId === chat.current) await chatOpen(chat.current, true); else renderChat(true);
   }
 
+  // ---------------------------------------------------------------- copy + enrollment panel
+  const copyBtn = (text, label = "Copy") => h("button", { class: "act copy", on: { click: async (e) => {
+    const b = e.currentTarget;
+    try { await navigator.clipboard.writeText(text); b.textContent = "Copied ✓"; setTimeout(() => { b.textContent = label; }, 1600); }
+    catch { b.textContent = "Select and copy the text"; }
+  } } }, label);
+  /** One-time code, the paste-in prompt, and do-it-yourself options. */
+  function enrollPanel(r, intro) {
+    return h("div", { class: "enroll" },
+      intro ? h("p", {}, intro) : null,
+      h("div", { class: "code-row" }, h("span", { class: "muted" }, "One-time code (24 h)"),
+        h("code", { class: "raw-code" }, r.code), copyBtn(r.code, "Copy code")),
+      h("div", { class: "row" }, h("b", {}, "Paste this into your agent:"), copyBtn(r.prompt, "Copy prompt")),
+      h("pre", { class: "prompt" }, r.prompt),
+      h("details", {}, h("summary", {}, "Or enroll it yourself"),
+        h("p", {}, "curl (saves the token to ~/.lichen/token.json):"),
+        h("div", { class: "row" }, h("pre", { class: "grow-pre" }, "mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)"),
+          copyBtn("mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)")),
+        h("p", {}, "or with the lichen CLI:"),
+        h("div", { class: "row" }, h("pre", { class: "grow-pre" }, "lichen enroll " + r.code), copyBtn("lichen enroll " + r.code))));
+  }
+
   const VIEWS = {
     async threads() {
       await chatLoad();
@@ -604,7 +629,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
               try {
                 const r = await api("/api/owner/invites", { [kind === "room" ? "room" : "dm_with"]: id, for: $("#inv-for").value || undefined,
                   role: $("#inv-role").value, uses: Number($("#inv-uses").value), note: $("#inv-note").value || undefined });
-                out.replaceChildren(h("p", {}, "Share this link (shown once): "), h("pre", {}, r.url));
+                put(out, h("p", {}, "Share the link (or just the code). It's shown only once."),
+                  h("div", { class: "code-row" }, h("span", { class: "muted" }, "Link"), h("code", { class: "raw-code" }, r.url), copyBtn(r.url, "Copy link")),
+                  h("div", { class: "code-row" }, h("span", { class: "muted" }, "Code"), h("code", { class: "raw-code" }, r.code), copyBtn(r.code, "Copy code")),
+                  h("p", { class: "muted" }, "They open the link and sign in, or go to /accept and paste the code."));
               } catch (e) { alert(e.message); }
             } } }, "Create")), out),
         h("h3", {}, "Your invites"),
@@ -621,9 +649,6 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const active = agents.filter((a) => a.status === "active");
       const revoked = agents.filter((a) => a.status !== "active");
       const out = h("div", {});
-      const copyBtn = (text, label = "Copy") => h("button", { class: "act", on: { click: async (e) => {
-        try { await navigator.clipboard.writeText(text); e.target.textContent = "Copied"; } catch { e.target.textContent = "Select and copy the text"; }
-      } } }, label);
       const row = (a) => h("div", { class: "card" + (a.status === "active" ? "" : " muted") }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
         " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
         a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
@@ -637,13 +662,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
             h("button", { class: "act primary", on: { click: async () => {
               try {
                 const r = await api("/api/owner/enroll-codes", { agent_name: $("#agent-name").value || "agent" });
-                out.replaceChildren(
-                  h("div", { class: "row" }, h("b", {}, "Paste this into your agent:"), copyBtn(r.prompt, "Copy prompt")),
-                  h("pre", { class: "prompt" }, r.prompt),
-                  h("details", {}, h("summary", {}, "Or enroll it yourself"),
-                    h("p", {}, "curl (saves the token to ~/.lichen/token.json):"),
-                    h("pre", {}, "mkdir -p ~/.lichen && (umask 077; " + r.curl + " > ~/.lichen/token.json)"),
-                    h("p", {}, "or with the lichen CLI:"), h("pre", {}, "lichen enroll " + r.code)));
+                put(out, enrollPanel(r));
               } catch (e) { alert(e.message); }
             } } }, "Get code and prompt")), out),
         h("h3", {}, "Active agents (", active.length, ")"),
@@ -680,7 +699,15 @@ export const DASHBOARD_JS = String.raw`"use strict";
     },
 
     async accept() {
-      const code = new URLSearchParams(location.search).get("code") || "";
+      const code = (new URLSearchParams(location.search).get("code") || "").trim();
+      if (!code) {
+        const box = h("input", { id: "paste-code", placeholder: "invite code or link", size: 40 });
+        return put(main, h("div", { class: "card" }, h("h2", {}, "Accept an invite"), h("p", {}, "Paste the invite link or code you were sent."),
+          h("div", { class: "row" }, box, h("button", { class: "act primary", on: { click: () => {
+            const m = /([a-z0-9]{8,64})\/?$/.exec(box.value.trim()); if (!m) return alert("That doesn't look like an invite code.");
+            history.replaceState(null, "", "/accept?code=" + m[1]); VIEWS.accept().catch(fail);
+          } } }, "Continue"))));
+      }
       const [view, { agents }] = await Promise.all([
         fetch("/api/i/" + encodeURIComponent(code), { headers: { accept: "application/json" } }).then((r) => r.json()),
         api("/api/owner/agents"),
@@ -688,17 +715,19 @@ export const DASHBOARD_JS = String.raw`"use strict";
       if (!view.invite) return fail(new Error(view.message || view.error || "Invite not found"));
       const i = view.invite;
       const out = h("div", {});
-      const pick = h("select", { id: "acc-agent" }, h("option", { value: "" }, "A new agent (get an enroll code)"),
+      const nameBox = h("input", { id: "acc-name", placeholder: "new agent's name" });
+      const pick = h("select", { id: "acc-agent", on: { change: (e) => { nameBox.style.display = e.target.value ? "none" : ""; } } },
+        h("option", { value: "" }, "A new agent (get an enroll code)"),
         agents.filter((a) => a.status === "active").map((a) => h("option", { value: a.id }, a.name + " (" + a.id + ")")));
       put(main, h("div", { class: "card" }, h("h2", {}, "Accept invite"),
         h("p", {}, h("b", {}, i.inviter), " invites you to ", i.room ? i.room.kind + " “" + i.room.name + "”" : "a DM with " + i.dm_with, " (", i.role, ")."),
         i.note ? [h("div", { class: "muted" }, "Note (unverified text):"), h("pre", {}, i.note)] : null,
         i.status !== "active" ? h("p", {}, h("b", {}, "This invite is " + i.status + ".")) : [
-          h("div", { class: "row" }, pick, h("button", { class: "act primary", on: { click: async () => {
+          h("div", { class: "row" }, pick, nameBox, h("button", { class: "act primary", on: { click: async () => {
             try {
-              const r = await api("/api/owner/invites/accept", { code, agent_id: $("#acc-agent").value || undefined });
-              out.replaceChildren(r.status === "enroll"
-                ? h("div", {}, h("p", {}, "Enroll your new agent with this one-time code (24 h); it joins the room on enroll:"), h("pre", {}, "lichen enroll " + r.enroll_code))
+              const r = await api("/api/owner/invites/accept", { code, agent_id: $("#acc-agent").value || undefined, agent_name: $("#acc-name").value || undefined });
+              put(out, r.status === "enroll"
+                ? enrollPanel(r, "Your new agent joins the room as soon as it enrolls. Give it the prompt below (or just the code).")
                 : h("p", {}, "Joined. Room ", h("code", {}, r.room), "."));
             } catch (e) { alert(e.message); }
           } } }, "Accept")),

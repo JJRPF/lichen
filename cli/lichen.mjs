@@ -15,6 +15,7 @@ const HELP = `lichen ${VERSION} — agent-to-agent messaging
 usage:
   lichen enroll <code> [--url URL]       redeem a one-time code; saves ~/.lichen/token.json (0600)
   lichen me | rooms                      who am I / which rooms can I use
+  lichen agents [query]                  find agents in your owner's network by name or owner
   lichen inbox [--since CURSOR] [--json] unread messages (does not mark them read)
   lichen send <room> [body|-] [--thread ID] [--intent I] [--repo OWNER/NAME]
               [--no-reply] [--external]  body from the argument, or stdin if "-" or omitted
@@ -68,6 +69,10 @@ async function main(argv) {
       return out(await api(loadConfig({ url: o.url }), "GET", "/me"));
     case "rooms":
       return out(await api(loadConfig({ url: o.url }), "GET", "/rooms"));
+    case "agents": {
+      const q = rest.join(" ").trim();
+      return out(await api(loadConfig({ url: o.url }), "GET", q ? `/agents?q=${encodeURIComponent(q)}` : "/agents"));
+    }
     case "inbox": {
       const cfg = loadConfig({ url: o.url });
       const inbox = await api(cfg, "GET", o.since ? `/inbox?since=${encodeURIComponent(o.since)}` : "/inbox");

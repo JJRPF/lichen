@@ -210,7 +210,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const b = await readBody(req);
     const inv = await findInvite(env, str(b.code, "code", 64, true)!);
     if (!inv) throw new HttpError(404, "invite_not_found");
-    return json(await acceptInvite(ctx, inv, owner.id, str(b.agent_id, "agent_id", 64)));
+    return json(await acceptInvite(ctx, inv, owner.id, str(b.agent_id, "agent_id", 64), str(b.agent_name, "agent_name", 64)));
   }
 
   // ---------------------------------------------------------------- approvals
