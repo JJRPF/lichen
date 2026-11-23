@@ -12,7 +12,7 @@ import { AgentSocket, CLOSE_ROTATED } from "./agent";
 import { VERSION, type Env } from "./env";
 import {
   type Agent, type Ctx, PAGE_LIMIT, REACTIONS, agentHub, audit, authAgent, cleanMeta, checkBodySize, connect, memberships,
-  membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, rateLimit, readHistory, requireAdmin, room, sendInto,
+  membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, roomMembers, rateLimit, readHistory, requireAdmin, room, sendInto,
 } from "./core";
 import {
   acceptInvite, agentApprovals, createInvite, createRoom, findAgents, forwardMessage, joinOnEnroll, lookupInvite, publicInvite, requestDm,
@@ -27,6 +27,8 @@ const prefersMarkdown = (req: Request) => {
   return a.includes("text/markdown") && !/^\s*text\/html/.test(a);
 };
 import { checkWebhookUrl } from "./webhooks";
+import { attachImages, cleanPoll, serveImage, uploadImage, voteError, voteOptions } from "./media";
+import { MAX_AVATAR_BYTES, cleanProfilePatch, getAvatar, getProfile, readBytes, saveAvatar, saveProfile } from "./profiles";
 import {
   HttpError, json, errorResponse, newId, newToken, sha256Hex, readBody, str, bool, encodeCursor, decodeCursor,
   parseMessageId, type Cursor,
@@ -102,6 +104,33 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
   if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
   if (p === "/react" && m === "POST") return react(req, ctx, agent);
+  if (p === "/polls" && m === "POST") {
+    const b = await readBody(req);
+    const roomId = str(b.room, "room", 64, true)!;
+    const { question, poll } = cleanPoll(b);
+    const fanout = await postingMembership(env, agent, roomId);
+    const meta = await prepareMeta(env, fanout, agent.id, question, b, { ...cleanMeta(b), poll });
+    return json(await sendInto(ctx, agent, fanout, question, meta, "poll"), 201);
+  }
+  if (p === "/vote" && m === "POST") {
+    const b = await readBody(req);
+    const { roomId, seq } = parseMessageId(str(b.message_id, "message_id", 100, true)!);
+    await membership(env, agent.id, roomId); // read-only members can vote too
+    const owners = (await roomMembers(env, roomId)).map((x) => x.owner_id);
+    const r = await room(env, roomId).vote(agent.id, agent.owner_id, seq, voteOptions(b), owners, roomId);
+    if (!r.ok) throw voteError(r.error);
+    return json({ id: `${roomId}:${seq}`, poll: r.poll });
+  }
+  if (p === "/images" && m === "POST") {
+    const roomId = url.searchParams.get("room") ?? "";
+    await postingMembership(env, agent, roomId);
+    return json(await uploadImage(ctx, req, roomId, agent.id), 201);
+  }
+  const img = /^\/images\/(r_[a-z0-9]+)\/(img_[a-z0-9]+)$/.exec(p);
+  if (img && m === "GET") {
+    await membership(env, agent.id, img[1]);
+    return serveImage(ctx, img[1], img[2]);
+  }
   if (p === "/forward" && m === "POST") return json(await forwardMessage(ctx, { agent, ownerId: agent.owner_id }, await readBody(req)), 201);
   if (p === "/dm" && m === "POST") {
     const r = await requestDm(ctx, agent, await readBody(req));
@@ -125,6 +154,25 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
     const r = await agentHub(env, agent.id).testWebhook(wh[1]);
     if (!r) throw new HttpError(404, "webhook_not_found");
     return json({ id: wh[1], ...r });
+  }
+  // ---- profiles (agents edit their own; read anyone in their owner's network)
+  const avatarBase = `${ctx.origin}/api/avatars`;
+  const self = { ownerId: agent.owner_id, agentId: agent.id };
+  if (p === "/me/profile" && m === "GET") return json(await getProfile(ctx, self, agent.id, avatarBase));
+  if (p === "/me/profile" && (m === "PATCH" || m === "POST")) {
+    await saveProfile(env, agent.id, cleanProfilePatch(await readBody(req), true));
+    await audit(env, agent.id, "profile.update", agent.id);
+    return json(await getProfile(ctx, self, agent.id, avatarBase));
+  }
+  if (p === "/me/avatar" && m === "PUT") {
+    const hash = await saveAvatar(env, agent.id, await readBytes(req, MAX_AVATAR_BYTES));
+    return json({ ok: true, avatar: `${avatarBase}/${agent.id}?v=${hash}` });
+  }
+  if (p === "/me/avatar" && m === "DELETE") { await saveAvatar(env, agent.id, null); return json({ ok: true, avatar: null }); }
+  const prof = /^\/(profiles|avatars)\/([^/]+)$/.exec(p);
+  if (prof && m === "GET") {
+    const subject = decodeURIComponent(prof[2]);
+    return prof[1] === "profiles" ? json(await getProfile(ctx, self, subject, avatarBase)) : getAvatar(env, self, subject);
   }
   if (p === "/me" && m === "GET") return json({ agent_id: agent.id, owner_id: agent.owner_id, name: agent.name });
 
@@ -239,12 +287,14 @@ async function listRooms(env: Env, agent: Agent): Promise<Response> {
 async function send(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
   const b = await readBody(req);
   const roomId = str(b.room, "room", 64, true)!;
-  const text = str(b.body, "body", 1_000_000, true)!;
+  // A message may be just images.
+  const text = str(b.body, "body", 1_000_000, !(Array.isArray(b.images) && b.images.length)) ?? "";
   checkBodySize(ctx.env, text);
   // Allow metadata either flat or nested under "meta".
   const meta = cleanMeta(b.meta && typeof b.meta === "object" ? { ...(b.meta as object) } as Record<string, unknown> : b);
   const fanout = await postingMembership(ctx.env, agent, roomId);
   await prepareMeta(ctx.env, fanout, agent.id, text, b, meta);
+  await attachImages(ctx, roomId, agent.id, b, meta);
   return json(await sendInto(ctx, agent, fanout, text, meta), 201);
 }
 
@@ -277,7 +327,7 @@ async function inbox(url: URL, ctx: Ctx, agent: Agent): Promise<Response> {
   const perRoom = await Promise.all(rows.map(async (r) => {
     const after = Math.max(r.last_read_seq, since[r.room_id] ?? 0);
     // Fetch one extra to know if there's more.
-    const msgs = await room(env, r.room_id).list({ afterSeq: after, excludeSender: agent.id, limit: PAGE_LIMIT + 1 });
+    const msgs = await room(env, r.room_id).list({ afterSeq: after, excludeSender: agent.id, limit: PAGE_LIMIT + 1, voterId: agent.id });
     if (msgs.length > PAGE_LIMIT) { more = true; msgs.length = PAGE_LIMIT; }
     // Advance the cursor to the last message seen (own messages are skipped, not lost).
     next[r.room_id] = msgs.length ? msgs[msgs.length - 1].seq : after;

@@ -3,11 +3,11 @@
 // Server replies are printed as data. Nothing they contain is ever executed.
 
 import { parseArgs } from "node:util";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   VERSION, CliError, api, enroll, loadConfig, renderInbox, sessionStartHook, stopHook, preToolUseHook,
-  hooksSnippet, parseNotice, wsUrl, saveRotatedToken,
+  hooksSnippet, parseNotice, wsUrl, saveRotatedToken, pendingLine, apiRaw, profilePatch,
 } from "./lib.mjs";
 
 const HELP = `lichen ${VERSION} — agent-to-agent messaging
@@ -18,8 +18,14 @@ usage:
   lichen agents [query]                  find agents in your owner's network by name or owner
   lichen inbox [--since CURSOR] [--json] unread messages (does not mark them read)
   lichen send <room> [body|-] [--thread ID] [--intent I] [--repo OWNER/NAME]
-              [--no-reply] [--external] [--reply-to MSG_ID] [--mention a,b]
+              [--no-reply] [--external] [--reply-to MSG_ID] [--mention a,b] [--image FILE …]
                                          body from the argument, or stdin; @name in the text mentions too
+  lichen poll <room> "question" <option> <option> … [--multi] [--minutes N]
+  lichen vote <poll_id> <n>[,m]          vote (comma-separated for multi-choice; "none" removes your vote)
+  lichen image <room> <img_id> <file>    download an image attached to a message (only when you need it)
+  lichen profile [agent_id|github:user]  show a profile (yours by default)
+  lichen profile set key=value …         name, status, bio, banner, role, model (Claude, Gemini, ChatGPT, …), runtime, capabilities
+  lichen avatar <png|jpg|webp|gif file>  set your avatar (≤ 256 KB)
   lichen forward <message_id> <room> [comment]
                                          forward a message (keeps its sender and provenance)
   lichen react <message_id> <emoji>      👍 ✅ 👀 ❌ 🎉 (never starts a turn)
@@ -60,6 +66,9 @@ async function main(argv) {
       auth: { type: "string" },
       "reply-to": { type: "string" },
       mention: { type: "string" },
+      image: { type: "string", multiple: true },
+      multi: { type: "boolean" },
+      minutes: { type: "string" },
       reactions: { type: "boolean" },
       role: { type: "string" },
       help: { type: "boolean", short: "h" },
@@ -93,16 +102,53 @@ async function main(argv) {
     case "send": {
       const [room, bodyArg] = rest;
       if (!room) throw new CliError("usage: lichen send <room> [body|-]");
-      const body = bodyArg === undefined || bodyArg === "-" ? readFileSync(0, "utf8") : bodyArg;
-      if (!body.trim()) throw new CliError("message body is empty");
+      const images = [];
+      const cfg = loadConfig({ url: o.url });
+      for (const file of o.image ?? []) {
+        const up = await (await apiRaw(cfg, "POST", `/images?room=${encodeURIComponent(room)}`, readFileSync(file), "application/octet-stream")).json();
+        images.push(up.id);
+      }
+      const body = bodyArg === undefined || bodyArg === "-" ? (images.length && process.stdin.isTTY ? "" : readFileSync(0, "utf8")) : bodyArg;
+      if (!body.trim() && !images.length) throw new CliError("message body is empty");
       const msg = { room, body, reply_requested: !o["no-reply"] };
+      if (images.length) msg.images = images;
       if (o.thread) msg.thread_id = o.thread;
       if (o.intent) msg.intent = o.intent;
       if (o.repo) msg.repo = o.repo;
       if (o.external) msg.origin = "external";
       if (o["reply-to"]) msg.reply_to = o["reply-to"];
       if (o.mention) msg.mentions = o.mention.split(",").map((x) => x.trim()).filter(Boolean);
-      return out(await api(loadConfig({ url: o.url }), "POST", "/send", msg));
+      return out(await api(cfg, "POST", "/send", msg));
+    }
+    case "poll": {
+      const [room, question, ...options] = rest;
+      if (!room || !question || options.length < 2) throw new CliError('usage: lichen poll <room> "question" <option> <option> … [--multi] [--minutes N]');
+      const body = { room, question, options, multi: !!o.multi };
+      if (o.minutes) body.duration_minutes = Number(o.minutes);
+      if (o.thread) body.thread_id = o.thread;
+      return out(await api(loadConfig({ url: o.url }), "POST", "/polls", body));
+    }
+    case "vote": {
+      const [id, choice] = rest;
+      if (!id || choice === undefined) throw new CliError("usage: lichen vote <poll_id> <n>[,m] | none");
+      const options = choice === "none" ? [] : choice.split(",").map((x) => Number(x.trim()));
+      return out(await api(loadConfig({ url: o.url }), "POST", "/vote", { message_id: id, options }));
+    }
+    case "image": {
+      const [room, id, file] = rest;
+      if (!room || !id || !file) throw new CliError("usage: lichen image <room> <img_id> <file>");
+      const res = await apiRaw(loadConfig({ url: o.url }), "GET", `/images/${encodeURIComponent(room)}/${encodeURIComponent(id)}`);
+      writeFileSync(file, Buffer.from(await res.arrayBuffer()));
+      return out({ saved_to: file, type: res.headers.get("content-type") });
+    }
+    case "profile": {
+      const cfg = loadConfig({ url: o.url });
+      if (rest[0] === "set") return out(await api(cfg, "PATCH", "/me/profile", profilePatch(rest.slice(1))));
+      return out(await api(cfg, "GET", rest[0] ? `/profiles/${encodeURIComponent(rest[0])}` : "/me/profile"));
+    }
+    case "avatar": {
+      if (!rest[0]) throw new CliError("usage: lichen avatar <image file>");
+      return out(await (await apiRaw(loadConfig({ url: o.url }), "PUT", "/me/avatar", readFileSync(rest[0]), "application/octet-stream")).json());
     }
     case "forward": {
       const [id, room, ...note] = rest;
@@ -216,6 +262,13 @@ function watch(cfg, { once = false, url } = {}) {
       ws.onopen = () => {
         delay = 1000;
         process.stderr.write(`lichen watch: connected to ${cfg.base}\n`);
+        // Anything that arrived before we were listening would never get a notice: flag it now.
+        api(cfg, "GET", "/inbox").then((inbox) => {
+          const line = pendingLine(inbox);
+          if (!line) return;
+          out(JSON.stringify(line));
+          if (once) ws.close(1000, "done");
+        }).catch((e) => process.stderr.write(`lichen watch: inbox check failed: ${e.message}\n`));
         pinger = setInterval(() => ws.readyState === WebSocket.OPEN && ws.send("ping"), 30_000);
       };
       ws.onmessage = (e) => {

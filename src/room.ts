@@ -34,11 +34,27 @@ export interface MessageMeta {
   /** A forwarded copy: who originally sent it, and when. */
   forwarded?: { id: string; sender_id: string; sender_owner_id: string; sender_kind: "agent" | "human"; created_at: number };
   forward_comment?: string;
+  /** Polls: the options (the question is the body). */
+  poll?: { options: string[]; multi: boolean; closes_at: number | null };
+  /** Images attached to this message; bytes are fetched separately. */
+  images?: ImageRef[];
 }
+
+export interface ImageRef { id: string; type: string; size: number; alt?: string }
+
+export interface PollState {
+  options: string[]; multi: boolean; closes_at: number | null; closed: boolean;
+  counts: number[]; voters: number; mine: number[];
+}
+
+/** Per-room cap on stored image bytes, and how long an unattached upload lives. */
+export const ROOM_IMAGE_BYTES = 100 * 1024 * 1024;
+const UNATTACHED_TTL_MS = 60 * 60 * 1000;
 
 export interface StoredMessage {
   seq: number;
-  kind: "message" | "reaction";
+  kind: "message" | "reaction" | "poll";
+  poll?: PollState;
   sender_id: string;
   sender_owner_id: string;
   body: string | null;
@@ -98,12 +114,28 @@ export class Room extends DurableObject<Env> {
         last_at    INTEGER NOT NULL,
         PRIMARY KEY (thread_id, sender_id)
       );
+      CREATE TABLE IF NOT EXISTS votes (
+        poll_seq  INTEGER NOT NULL,
+        voter_id  TEXT NOT NULL,
+        option    INTEGER NOT NULL,
+        voted_at  INTEGER NOT NULL,
+        PRIMARY KEY (poll_seq, voter_id, option)
+      );
+      CREATE TABLE IF NOT EXISTS images (
+        id          TEXT PRIMARY KEY,
+        uploader    TEXT NOT NULL,
+        type        TEXT NOT NULL,
+        size        INTEGER NOT NULL,
+        data        BLOB NOT NULL,
+        claimed     INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+      );
     `);
   }
 
   /** Append an agent message, applying the turn cap and cooldown. */
   async sendMessage(
-    env: Envelope, body: string, meta: MessageMeta, limits: Limits, fanout?: Fanout,
+    env: Envelope, body: string, meta: MessageMeta, limits: Limits, fanout?: Fanout, kind: "message" | "poll" = "message",
   ): Promise<AppendResult> {
     const now = Date.now();
     const thread = meta.thread_id ?? "";
@@ -127,8 +159,8 @@ export class Room extends DurableObject<Env> {
 
     const seq = this.sql.exec<{ seq: number }>(
       `INSERT INTO messages (kind, sender_id, sender_owner_id, body, meta, thread_id, created_at)
-       VALUES ('message', ?, ?, ?, ?, ?, ?) RETURNING seq`,
-      env.sender_id, env.sender_owner_id, body, JSON.stringify(meta), thread, now,
+       VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+      kind, env.sender_id, env.sender_owner_id, body, JSON.stringify(meta), thread, now,
     ).one().seq;
     this.sql.exec(
       `INSERT INTO threads (thread_id, agent_streak, paused) VALUES (?, ?, ?)
@@ -149,13 +181,13 @@ export class Room extends DurableObject<Env> {
    * cap waits for: it resets the thread's agent streak and unpauses it.
    * No cooldown applies.
    */
-  async sendHuman(env: Envelope, body: string, meta: MessageMeta, fanout?: Fanout): Promise<{ seq: number; created_at: number }> {
+  async sendHuman(env: Envelope, body: string, meta: MessageMeta, fanout?: Fanout, kind: "message" | "poll" = "message"): Promise<{ seq: number; created_at: number }> {
     const now = Date.now();
     const thread = meta.thread_id ?? "";
     const seq = this.sql.exec<{ seq: number }>(
       `INSERT INTO messages (kind, sender_id, sender_owner_id, body, meta, thread_id, created_at)
-       VALUES ('message', ?, ?, ?, ?, ?, ?) RETURNING seq`,
-      env.sender_id, env.sender_owner_id, body, JSON.stringify(meta), thread, now,
+       VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING seq`,
+      kind, env.sender_id, env.sender_owner_id, body, JSON.stringify(meta), thread, now,
     ).one().seq;
     this.sql.exec(
       `INSERT INTO threads (thread_id, agent_streak, paused) VALUES (?, 0, 0)
@@ -169,7 +201,7 @@ export class Room extends DurableObject<Env> {
   /** Reactions never count toward the turn cap and are flagged no_turn on read. */
   async react(env: Envelope, targetSeq: number, emoji: string, fanout?: Fanout): Promise<AppendResult> {
     const target = this.sql.exec<{ thread_id: string }>(
-      "SELECT thread_id FROM messages WHERE seq = ? AND kind = 'message'", targetSeq,
+      "SELECT thread_id FROM messages WHERE seq = ? AND kind IN ('message', 'poll')", targetSeq,
     ).toArray()[0];
     if (!target) return { ok: false, error: "target_not_found" };
     const now = Date.now();
@@ -217,7 +249,7 @@ export class Room extends DurableObject<Env> {
   }
 
   /** Messages with seq > afterSeq, oldest first. */
-  async list(opts: { afterSeq?: number; beforeSeq?: number; threadId?: string; excludeSender?: string; limit: number }): Promise<StoredMessage[]> {
+  async list(opts: { afterSeq?: number; beforeSeq?: number; threadId?: string; excludeSender?: string; limit: number; voterId?: string }): Promise<StoredMessage[]> {
     const where: string[] = ["seq > ?"];
     const args: (string | number)[] = [opts.afterSeq ?? 0];
     if (opts.beforeSeq !== undefined) { where.push("seq < ?"); args.push(opts.beforeSeq); }
@@ -232,17 +264,91 @@ export class Room extends DurableObject<Env> {
     ).toArray();
     if (backwards) rows.reverse();
 
-    return rows.map((r) => ({
-      seq: r.seq as number,
-      kind: r.kind as StoredMessage["kind"],
-      sender_id: r.sender_id as string,
-      sender_owner_id: r.sender_owner_id as string,
-      body: (r.body as string | null) ?? null,
-      meta: r.meta ? (JSON.parse(r.meta as string) as MessageMeta) : null,
-      target_seq: (r.target_seq as number | null) ?? null,
-      emoji: (r.emoji as string | null) ?? null,
-      created_at: r.created_at as number,
-    }));
+    return rows.map((r) => {
+      const m: StoredMessage = {
+        seq: r.seq as number,
+        kind: r.kind as StoredMessage["kind"],
+        sender_id: r.sender_id as string,
+        sender_owner_id: r.sender_owner_id as string,
+        body: (r.body as string | null) ?? null,
+        meta: r.meta ? (JSON.parse(r.meta as string) as MessageMeta) : null,
+        target_seq: (r.target_seq as number | null) ?? null,
+        emoji: (r.emoji as string | null) ?? null,
+        created_at: r.created_at as number,
+      };
+      if (m.kind === "poll" && m.meta?.poll) m.poll = this.pollState(m.seq, m.meta.poll, opts.voterId);
+      return m;
+    });
+  }
+
+  // ---------------------------------------------------------------- polls
+
+  private pollState(seq: number, p: NonNullable<MessageMeta["poll"]>, voterId?: string): PollState {
+    const counts = p.options.map(() => 0);
+    for (const r of this.sql.exec<{ option: number; n: number }>(
+      "SELECT option, COUNT(*) AS n FROM votes WHERE poll_seq = ? GROUP BY option", seq,
+    ).toArray()) if (r.option < counts.length) counts[r.option] = r.n;
+    const voters = this.sql.exec<{ n: number }>("SELECT COUNT(DISTINCT voter_id) AS n FROM votes WHERE poll_seq = ?", seq).one().n;
+    const mine = voterId
+      ? this.sql.exec<{ option: number }>("SELECT option FROM votes WHERE poll_seq = ? AND voter_id = ? ORDER BY option", seq, voterId).toArray().map((r) => r.option)
+      : [];
+    return { options: p.options, multi: p.multi, closes_at: p.closes_at, closed: !!p.closes_at && p.closes_at <= Date.now(), counts, voters, mine };
+  }
+
+  /**
+   * Replace `voterId`'s votes on a poll (an empty list removes them). Votes
+   * never start a turn: only owners' dashboards are told, so results update live.
+   */
+  async vote(voterId: string, voterOwner: string, seq: number, options: number[], owners: string[], roomId: string):
+    Promise<{ ok: true; poll: PollState } | { ok: false; error: "poll_not_found" | "poll_closed" | "invalid_option" }> {
+    const row = this.sql.exec<{ meta: string }>("SELECT meta FROM messages WHERE seq = ? AND kind = 'poll'", seq).toArray()[0];
+    if (!row) return { ok: false, error: "poll_not_found" };
+    const p = (JSON.parse(row.meta) as MessageMeta).poll!;
+    if (p.closes_at && p.closes_at <= Date.now()) return { ok: false, error: "poll_closed" };
+    const uniq = [...new Set(options)];
+    if (uniq.some((o) => !Number.isInteger(o) || o < 0 || o >= p.options.length) || (!p.multi && uniq.length > 1)) {
+      return { ok: false, error: "invalid_option" };
+    }
+    this.sql.exec("DELETE FROM votes WHERE poll_seq = ? AND voter_id = ?", seq, voterId);
+    for (const o of uniq) this.sql.exec("INSERT INTO votes (poll_seq, voter_id, option, voted_at) VALUES (?, ?, ?, ?)", seq, voterId, o, Date.now());
+    const n: Notice = { id: `${roomId}:${seq}`, room: roomId, from: voterId, trust_tier: "same_owner", no_turn: true };
+    this.ctx.waitUntil(Promise.allSettled([...new Set(owners)].map((o) =>
+      this.env.AGENT.get(this.env.AGENT.idFromName(ownerHubName(o))).notify({ ...n, trust_tier: tierFor(o, voterOwner) }))));
+    return { ok: true, poll: this.pollState(seq, p, voterId) };
+  }
+
+  // ---------------------------------------------------------------- images
+
+  /** Keep an uploaded image until a message claims it (or it expires unclaimed). */
+  async storeImage(uploader: string, type: string, data: Uint8Array):
+    Promise<{ ok: true; id: string } | { ok: false; error: "room_storage_full" }> {
+    const now = Date.now();
+    this.sql.exec("DELETE FROM images WHERE claimed = 0 AND created_at < ?", now - UNATTACHED_TTL_MS);
+    const used = this.sql.exec<{ n: number | null }>("SELECT SUM(size) AS n FROM images").one().n ?? 0;
+    if (used + data.byteLength > ROOM_IMAGE_BYTES) return { ok: false, error: "room_storage_full" };
+    const id = "img_" + crypto.randomUUID().replace(/-/g, "").slice(0, 16);
+    this.sql.exec("INSERT INTO images (id, uploader, type, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      id, uploader, type, data.byteLength, data, now);
+    return { ok: true, id };
+  }
+
+  /** Claim the uploader's own unclaimed images for a message. All or nothing. */
+  async claimImages(uploader: string, ids: string[], alts: (string | undefined)[]): Promise<ImageRef[] | null> {
+    const refs: ImageRef[] = [];
+    for (const [i, id] of ids.entries()) {
+      const r = this.sql.exec<{ type: string; size: number }>(
+        "SELECT type, size FROM images WHERE id = ? AND uploader = ? AND claimed = 0", id, uploader,
+      ).toArray()[0];
+      if (!r) return null;
+      refs.push({ id, type: r.type, size: r.size, ...(alts[i] ? { alt: alts[i] } : {}) });
+    }
+    for (const id of ids) this.sql.exec("UPDATE images SET claimed = 1 WHERE id = ?", id);
+    return refs;
+  }
+
+  async getImage(id: string): Promise<{ type: string; data: ArrayBuffer } | null> {
+    const r = this.sql.exec<{ type: string; data: ArrayBuffer }>("SELECT type, data FROM images WHERE id = ? AND claimed = 1", id).toArray()[0];
+    return r ?? null;
   }
 
   /** Latest message, for sidebars: seq, time, sender and a short preview. */

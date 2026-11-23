@@ -12,12 +12,14 @@
 import { accessConfigured, accessToken, verifyAccess } from "./access";
 import {
   type Ctx, type Owner, agentHub, audit, connect, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
-  cleanMeta, ownerFanout, prepareMeta, rateLimit, readHistory, room, sendAsOwner,
+  cleanMeta, ownerFanout, prepareMeta, rateLimit, readHistory, room, roomMembers, sendAsOwner,
 } from "./core";
+import { attachImages, cleanPoll, serveImage, uploadImage, voteError, voteOptions } from "./media";
 import { ownerHubName } from "./env";
 import { acceptInvite, forwardMessage, humanDm, createInvite, createRoom, decideApproval, findInvite } from "./social";
 import { DASHBOARD_JS, dashboardPage } from "./pages";
-import { HttpError, json, readBody, str } from "./util";
+import { MAX_AVATAR_BYTES, cleanProfilePatch, getAvatar, getProfile, readBytes, saveAvatar, saveNote, saveProfile } from "./profiles";
+import { HttpError, json, parseMessageId, readBody, str } from "./util";
 
 interface OwnerAuth { owner: Owner; via: "access" | "admin" }
 
@@ -37,7 +39,12 @@ export function pageRoute(ctx: Ctx, p: string): Response | null {
 /** /api/owner/*; `p` is the path with /api stripped. */
 export async function ownerRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL): Promise<Response> {
   const auth = await authOwner(req, ctx);
-  if (auth.via === "access" && m !== "GET") checkSameOrigin(req, ctx, true);
+  // Image uploads (avatars, message images) send image/* bodies; everything else must be JSON.
+  const isUpload = /\/avatar$|^\/owner\/images$/.test(p);
+  if (auth.via === "access" && m !== "GET") checkSameOrigin(req, ctx, !isUpload);
+  if (isUpload && m === "PUT" || isUpload && m === "POST") {
+    if (!(req.headers.get("content-type") ?? "").startsWith("image/")) throw new HttpError(415, "image_required");
+  }
   return ownerApi(req, ctx, auth, p, m, url);
 }
 
@@ -82,6 +89,36 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
   if (p === "/owner/ws" && m === "GET") {
     if (auth.via === "access") checkSameOrigin(req, ctx, false); // no cross-site WebSocket hijacking
     return connect(req, env, ownerHubName(owner.id));
+  }
+
+  // ---- profiles
+  const avatarBase = `${ctx.origin}/api/owner/avatars`;
+  const viewer = { ownerId: owner.id };
+  let pm = /^\/owner\/(profiles|avatars)\/([^/]+)$/.exec(p);
+  if (pm && m === "GET") {
+    const subject = decodeURIComponent(pm[2]);
+    return pm[1] === "profiles" ? json(await getProfile(ctx, viewer, subject, avatarBase)) : getAvatar(env, viewer, subject);
+  }
+  pm = /^\/owner\/notes\/([^/]+)$/.exec(p);
+  if (pm && (m === "PUT" || m === "POST")) return json(await saveNote(env, owner.id, decodeURIComponent(pm[1]), (await readBody(req)).note));
+  // Your own profile, or one of your agents'.
+  pm = /^\/owner\/(?:agents\/(agt_[a-z0-9]+)\/)?(profile|avatar)$/.exec(p);
+  if (pm) {
+    const subject = pm[1] ?? owner.id;
+    if (pm[1]) {
+      const own = await env.DB.prepare("SELECT 1 AS ok FROM agents WHERE id = ? AND owner_id = ?").bind(pm[1], owner.id).first();
+      if (!own) throw new HttpError(404, "agent_not_found");
+    }
+    if (pm[2] === "profile" && (m === "PATCH" || m === "POST")) {
+      await saveProfile(env, subject, cleanProfilePatch(await readBody(req), !!pm[1]));
+      await audit(env, owner.id, "profile.update", subject);
+      return json(await getProfile(ctx, viewer, subject, avatarBase));
+    }
+    if (pm[2] === "avatar" && (m === "PUT" || m === "POST")) {
+      const hash = await saveAvatar(env, subject, await readBytes(req, MAX_AVATAR_BYTES));
+      return json({ ok: true, avatar: `${avatarBase}/${encodeURIComponent(subject)}?v=${hash}` });
+    }
+    if (pm[2] === "avatar" && m === "DELETE") { await saveAvatar(env, subject, null); return json({ ok: true, avatar: null }); }
   }
 
   if (p === "/owner/me" && m === "GET") {
@@ -133,14 +170,20 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const ids = await ownerRoomIds(env, owner.id);
     if (!ids.length) return json({ rooms: [] });
     const { results } = await env.DB.prepare(
-      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role
+      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role,
+              p.display_name, p.avatar_hash, p.status_text
        FROM rooms r JOIN memberships m ON m.room_id = r.id JOIN agents a ON a.id = m.agent_id
+       LEFT JOIN profiles p ON p.subject_id = a.id
        WHERE r.id IN (${ids.map(() => "?").join(",")}) ORDER BY r.created_at`,
     ).bind(...ids).all<Record<string, any>>();
     const rooms = new Map<string, any>();
     for (const r of results) {
       const entry = rooms.get(r.id) ?? { id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at, human_owner: r.human_owner, members: [] };
-      entry.members.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role });
+      entry.members.push({
+        agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role,
+        display_name: r.display_name ?? null, status_text: r.status_text ?? null,
+        avatar: r.avatar_hash ? `${ctx.origin}/api/owner/avatars/${r.agent_id}?v=${r.avatar_hash}` : null,
+      });
       rooms.set(r.id, entry);
     }
     // Latest activity per room, for sorting and unread dots in the chat sidebar.
@@ -170,10 +213,38 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     // The owner posts into a thread as a human. Same metadata rules as agents.
     const b = await readBody(req);
     const roomId = str(b.room, "room", 64, true)!;
-    const text = str(b.body, "body", 1_000_000, true)!;
+    const text = str(b.body, "body", 1_000_000, !(Array.isArray(b.images) && b.images.length)) ?? "";
     const fanout = await ownerFanout(env, owner.id, roomId);
     const meta = await prepareMeta(env, fanout, owner.id, text, b, cleanMeta(b));
+    await attachImages(ctx, roomId, owner.id, b, meta);
     return json(await sendAsOwner(ctx, owner.id, roomId, text, meta, fanout), 201);
+  }
+  if (p === "/owner/polls" && m === "POST") {
+    const b = await readBody(req);
+    const roomId = str(b.room, "room", 64, true)!;
+    const { question, poll } = cleanPoll(b);
+    const fanout = await ownerFanout(env, owner.id, roomId);
+    const meta = await prepareMeta(env, fanout, owner.id, question, b, { ...cleanMeta(b), poll });
+    return json(await sendAsOwner(ctx, owner.id, roomId, question, meta, fanout, "poll"), 201);
+  }
+  if (p === "/owner/vote" && m === "POST") {
+    const b = await readBody(req);
+    const { roomId, seq } = parseMessageId(str(b.message_id, "message_id", 100, true)!);
+    if (!(await ownerCanSeeRoom(env, owner.id, roomId))) throw new HttpError(404, "room_not_found");
+    const owners = (await roomMembers(env, roomId)).map((x) => x.owner_id);
+    const r = await room(env, roomId).vote(owner.id, owner.id, seq, voteOptions(b), owners, roomId);
+    if (!r.ok) throw voteError(r.error);
+    return json({ id: `${roomId}:${seq}`, poll: r.poll });
+  }
+  if (p === "/owner/images" && m === "POST") {
+    const roomId = url.searchParams.get("room") ?? "";
+    await ownerFanout(env, owner.id, roomId); // must have an agent in the room
+    return json(await uploadImage(ctx, req, roomId, owner.id), 201);
+  }
+  const oi = /^\/owner\/images\/(r_[a-z0-9]+)\/(img_[a-z0-9]+)$/.exec(p);
+  if (oi && m === "GET") {
+    if (!(await ownerCanSeeRoom(env, owner.id, oi[1]))) throw new HttpError(404, "not_found");
+    return serveImage(ctx, oi[1], oi[2]);
   }
   if (p === "/owner/forward" && m === "POST") {
     return json(await forwardMessage(ctx, { ownerId: owner.id }, await readBody(req)), 201);

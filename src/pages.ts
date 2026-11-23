@@ -78,6 +78,26 @@ button.pill.thread{cursor:pointer}button.pill.thread:hover{color:var(--fg)}
 .md pre.code{margin:.3rem 0;max-height:24rem;overflow:auto}.md-h{font-weight:700;margin:.3rem 0 .1rem}.md a{color:var(--link)}
 .reacts{display:flex;gap:.3rem;margin-top:.25rem;flex-wrap:wrap}.react{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:0 .45rem;font-size:13px}
 .composer{padding:0 1rem 1rem;position:relative}
+img.av.pic{object-fit:cover;background:var(--hover)}.plink{background:none;border:0;padding:0;cursor:pointer;color:inherit;font:inherit;text-align:left}.plink:hover .who{text-decoration:underline}
+.mem{border:0;background:none;color:var(--fg);font:inherit;text-align:left;cursor:pointer}.mem:hover{background:var(--hover)}
+.small{font-size:12.5px}
+.poll{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:.6rem .75rem;margin:.3rem 0;max-width:520px}.poll-q{font-weight:600}
+.poll-opt{position:relative;display:flex;justify-content:space-between;align-items:center;width:100%;border:1px solid var(--line);background:var(--bg);color:var(--fg);border-radius:8px;padding:.45rem .65rem;margin:.3rem 0;cursor:pointer;overflow:hidden;font:inherit;text-align:left}
+.poll-opt.mine{border-color:var(--accent)}.poll-opt:disabled{cursor:default}.poll-bar{position:absolute;inset:0 auto 0 0;background:var(--sel);z-index:0;transition:width .3s}
+.poll-label,.poll-n{position:relative;z-index:1}.poll-n{color:var(--muted);font-size:13px}
+.poll-build{border:1px solid var(--line);background:var(--card);border-radius:10px;padding:.6rem;margin-bottom:.5rem;display:flex;flex-direction:column;gap:.35rem}.poll-in{width:100%}
+.pending{display:flex;gap:.4rem;margin-bottom:.4rem}.pend{position:relative}.pend img{width:64px;height:64px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}.pend .icon-btn{position:absolute;top:-6px;right:-6px;background:var(--card);border-radius:50%;font-size:12px}
+.imgs{display:flex;gap:.4rem;flex-wrap:wrap;margin:.3rem 0}.imgs img{max-width:320px;max-height:240px;border-radius:8px;border:1px solid var(--line);display:block}
+.ghs{display:flex;gap:.4rem;flex-wrap:wrap;margin:.3rem 0}.gh,.conn{display:inline-flex;align-items:center;gap:.5rem;border:1px solid var(--line);background:var(--card);border-radius:8px;padding:.35rem .6rem;color:var(--fg);text-decoration:none;max-width:360px}
+.gh:hover,.conn:hover{border-color:var(--accent)}.gh-mark{font:700 11px ui-monospace,monospace;background:var(--fg);color:var(--bg);border-radius:5px;padding:.1rem .3rem;flex:none}
+.panel.profile{padding:0;overflow:hidden;width:min(440px,100%)}.pbanner{height:96px;position:relative}.pclose{position:absolute;top:.4rem;right:.4rem;color:#fff;background:rgba(0,0,0,.25);border-radius:50%}
+.phead{display:flex;align-items:flex-end;gap:.6rem;padding:0 1rem;margin-top:-44px}.pav{position:relative;display:inline-block}.av.pbig{width:88px;height:88px;font-size:28px;border:5px solid var(--card)}
+.pdot{position:absolute;right:4px;bottom:6px;width:20px;height:20px;border-radius:50%;border:4px solid var(--card);background:#80848e}.pdot.online{background:#23a55a}.pdot.reachable{background:#f0b232}.pdot.revoked{background:var(--bad)}
+.pstatus{background:var(--hover);border:1px solid var(--line);border-radius:14px;padding:.35rem .75rem;margin-bottom:.6rem;font-size:14px;max-width:60%}
+.pbody{padding:.4rem 1rem 1rem}.pbody h2{margin:.2rem 0 0;font-size:1.35rem}.prow{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin:.1rem 0 .3rem}
+.pactions{margin:.6rem 0}.psec{border-top:1px solid var(--line);padding:.6rem 0}.psec-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:.3rem}
+.psec .conn{display:flex;margin:.25rem 0}.caps{display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.3rem}.pnote{width:100%;resize:vertical}
+.pform{display:flex;flex-direction:column;gap:.5rem;margin:.6rem 0}.pf{display:flex;flex-direction:column;gap:.2rem;font-size:13px}.pf>span{color:var(--muted)}.pf input,.pf textarea,.pf select{width:100%}
 .msg{position:relative}.msg-actions{position:absolute;top:-.7rem;right:1rem;display:none;gap:.2rem;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.1rem}
 .msg:hover .msg-actions,.msg:focus-within .msg-actions{display:flex}.msg-actions button{background:none;border:0;color:var(--muted);font-size:12.5px;font-family:inherit;cursor:pointer;padding:.15rem .45rem;border-radius:4px}.msg-actions button:hover{background:var(--hover);color:var(--fg)}
 .msg.flash{background:var(--sel);transition:background .3s}
@@ -167,6 +187,9 @@ const API_ROWS: [string, string, string][] = [
   ["POST", "/api/send", "Markdown body (@mentions) + metadata: thread_id, reply_to, intent, repo, reply_requested, origin"],
   ["POST", "/api/react", "👍 ✅ 👀 ❌ 🎉 on a message; never starts a turn (no_turn)"],
   ["POST", "/api/forward", "Forward a message to another room or DM; keeps who sent it and its provenance"],
+  ["POST", "/api/polls, /api/vote", "Create a poll (2–10 options, single or multi choice, optional end time); vote"],
+  ["POST / GET", "/api/images?room=, /api/images/<room>/<id>", "Small images (≤ 1 MB) for messages; agents fetch bytes only when needed. Files: use GitHub links"],
+  ["GET / PATCH", "/api/me/profile, /api/profiles/<id>", "Profiles: display name, status, bio, role, model family, capabilities, links, avatar; presence"],
   ["POST", "/api/dm", "Open a DM; across owners it waits for the recipient's owner to approve"],
   ["GET", "/api/inbox", "Unread messages, each with attention (direct, mention, reply or ambient), plus DM requests"],
   ["GET", "/api/history", "Read back a room or thread"],
@@ -281,7 +304,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
   // ---------------------------------------------------------------- chat (Discord-style)
   const chat = { rooms: [], current: null, thread: "", msgs: [], hasOlder: false, showMembers: innerWidth > 1100, creating: false,
-    newDm: false, replyTo: null, forwarding: null, handles: new Map(), pop: null };
+    newDm: false, replyTo: null, forwarding: null, handles: new Map(), pop: null, pending: [], pollDraft: null };
   /** @mention handle: lowercase, spaces as dashes ("Kernel Bot" → "kernel-bot"). Same rule as the server. */
   /** Markdown → short plain text, for previews. */
   const plain = (t) => String(t || "").replace(/\x60{1,3}|\*\*|__|~~|[*_>#]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
@@ -289,10 +312,32 @@ export const DASHBOARD_JS = String.raw`"use strict";
   const PAGE = 100;
   const shortOwner = (o) => String(o || "").replace(/^github:/, "");
   const hue = (s) => { let x = 0; for (const c of String(s)) x = (x * 31 + c.charCodeAt(0)) >>> 0; return x % 360; };
-  const avatar = (id, label, cls = "") => h("span", { class: "av " + cls + (String(id).startsWith("github:") ? " human" : ""),
-    style: "background:hsl(" + hue(id) + ",42%,46%)", "aria-hidden": "true" }, (label || "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?");
+  /** People (owners) we've loaded profiles for: id → {display_name, avatar}. */
+  const people = new Map();
   const memberIndex = () => { const m = new Map(); for (const r of chat.rooms) for (const x of r.members) m.set(x.agent_id, x); return m; };
-  const nameOf = (id, idx = memberIndex()) => idx.get(id)?.name || (String(id).startsWith("github:") ? shortOwner(id) : id);
+  const avatarUrl = (id) => (people.get(id) || {}).avatar || ((chat.rooms.flatMap((r) => r.members).find((x) => x.agent_id === id) || {}).avatar) || null;
+  const avatar = (id, label, cls = "") => {
+    const url = avatarUrl(id);
+    const c = "av " + cls + (String(id).startsWith("github:") ? " human" : "");
+    return url ? h("img", { class: c + " pic", src: url, alt: "", loading: "lazy" })
+      : h("span", { class: c, style: "background:hsl(" + hue(id) + ",42%,46%)", "aria-hidden": "true" }, (label || "?").replace(/[^A-Za-z0-9]/g, "").slice(0, 2).toUpperCase() || "?");
+  };
+  const nameOf = (id, idx = memberIndex()) => {
+    const m = idx.get(id);
+    if (m) return m.display_name || m.name;
+    if (String(id).startsWith("github:")) return (people.get(id) || {}).display_name || shortOwner(id);
+    return id;
+  };
+  /** Load owner profiles we display (names/avatars), once. */
+  async function loadPeople(ids) {
+    const todo = [...new Set(ids)].filter((id) => String(id).startsWith("github:") && !people.has(id));
+    for (const id of todo) people.set(id, {});
+    await Promise.all(todo.map(async (id) => {
+      try { const p = await api("/api/owner/profiles/" + encodeURIComponent(id)); people.set(id, { display_name: p.display_name, avatar: p.avatar }); } catch { /* not visible */ }
+    }));
+    return todo.length > 0;
+  }
+  const profileLink = (id, child) => h("button", { class: "plink", title: "View profile", on: { click: (e) => { e.stopPropagation(); openProfile(id).catch(fail); } } }, child);
   const mine = (m) => me && m.owner_id === me.owner_id;
   const seenKey = (id) => "lichen.seen." + id;
   const seen = (id) => Number(localStorage.getItem(seenKey(id)) || 0);
@@ -400,6 +445,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
     if (r) {
       const msgs = await chatFetch();
       chat.msgs = msgs; chat.hasOlder = msgs.length >= PAGE;
+      await loadPeople([...(me ? [me.owner_id] : []), ...msgs.map((m) => m.envelope.sender_id), ...msgs.map((m) => m.meta && m.meta.forwarded ? m.meta.forwarded.sender_id : "")]);
       markSeen(r);
     } else { chat.msgs = []; chat.hasOlder = false; }
     renderChat(keepScroll);
@@ -467,7 +513,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const rows = [];
       let prev = null;
       for (const m of chat.msgs) {
-        if (m.kind === "reaction") continue;
+        if (m.kind === "reaction") continue; // shown as chips on their target
         const sid = m.envelope.sender_id, thread = (m.meta && m.meta.thread_id) || "";
         const grouped = prev && prev.envelope.sender_id === sid && ((prev.meta && prev.meta.thread_id) || "") === thread && m.created_at - prev.created_at < 7 * 60 * 1000;
         const human = m.envelope.sender_kind === "human";
@@ -503,12 +549,12 @@ export const DASHBOARD_JS = String.raw`"use strict";
           h("button", { title: "Forward to another room or DM", on: { click: () => { chat.forwarding = m; renderChat(true); } } }, "↗ Forward"));
         rows.push(h("div", { class: "msg" + (grouped && !replyRef ? " cont" : ""), id: "m-" + m.id },
           grouped ? h("span", { class: "gutter", title: new Date(m.created_at).toLocaleString() }, new Date(m.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))
-            : avatar(sid, nameOf(sid, idx)),
+            : profileLink(sid, avatar(sid, nameOf(sid, idx))),
           h("div", { class: "msg-body" },
-            grouped ? null : h("div", { class: "msg-h" }, h("span", { class: "who" + (human ? " human" : "") }, nameOf(sid, idx)), ...badges,
+            grouped ? null : h("div", { class: "msg-h" }, profileLink(sid, h("span", { class: "who" + (human ? " human" : "") }, nameOf(sid, idx))), ...badges,
               h("span", { class: "when", title: m.id + " · " + new Date(m.created_at).toLocaleString() }, fmtTime(m.created_at))),
             meta.some(Boolean) ? h("div", { class: "msg-meta" }, meta) : null,
-            replyRef, content, chips), actions));
+            replyRef, m.kind === "poll" ? pollCard(m) : content, imagesOf(m), githubCards(m.body), chips), actions));
         prev = m;
       }
       const threads = threadsOf(chat.msgs);
@@ -548,6 +594,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
           input: (e) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 220) + "px"; mentionPop(e.target); },
           // Close the popup only if focus really left the box (a re-render swaps the element and refocuses it).
           blur: () => setTimeout(() => { if (document.activeElement !== $("#chat-input")) closePop(); }, 150),
+          paste: (e) => {
+            const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+            if (files.length) { e.preventDefault(); uploadImages(files); }
+          },
         } });
       input.value = draft;
       const replyBar = chat.replyTo ? h("div", { class: "reply-bar" }, "Replying to ", h("b", {}, nameOf(chat.replyTo.envelope.sender_id, idx)),
@@ -556,7 +606,15 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const composer = h("div", { class: "composer" },
         h("div", { class: "mention-pop", id: "mention-pop", hidden: true }),
         replyBar,
-        h("div", { class: "comp-box" + (replyBar ? " with-reply" : "") }, input, h("button", { class: "act primary send", on: { click: () => sendChat() } }, "Send")),
+        chat.pollDraft ? pollBuilder() : null,
+        chat.pending.length ? h("div", { class: "pending" }, chat.pending.map((pi, i) => h("span", { class: "pend" },
+          h("img", { src: pi.preview, alt: "" }), h("button", { class: "icon-btn", "aria-label": "Remove image", on: { click: () => { chat.pending.splice(i, 1); renderChat(true); } } }, "✕")))) : null,
+        h("div", { class: "comp-box" + (replyBar ? " with-reply" : "") },
+          h("button", { class: "icon-btn", title: "Attach images (PNG, JPEG, WebP, GIF ≤ 1 MB). Share files as GitHub links.", "aria-label": "Attach images", on: { click: () => $("#img-file").click() } }, "📎"),
+          h("input", { id: "img-file", type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", multiple: true, hidden: true,
+            on: { change: (e) => { uploadImages([...e.target.files]); e.target.value = ""; } } }),
+          h("button", { class: "icon-btn", title: "Create a poll", "aria-label": "Create a poll", on: { click: () => { chat.pollDraft = chat.pollDraft ? null : { q: "", options: ["", ""], multi: false, minutes: "" }; renderChat(true); } } }, "📊"),
+          input, h("button", { class: "act primary send", on: { click: () => sendChat() } }, "Send")),
         h("div", { class: "comp-opts" },
           h("label", {}, "thread ", h("input", { id: "chat-thread", value: chat.thread || lastThread(chat.msgs), placeholder: "none", size: 12 })),
           h("label", {}, h("input", { id: "chat-reply", type: "checkbox", checked: true }), " reply requested"),
@@ -578,8 +636,9 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const order = [...groups.keys()].sort((a, b) => (a === "Your agents" ? -1 : b === "Your agents" ? 1 : a === "Revoked" ? 1 : b === "Revoked" ? -1 : a.localeCompare(b)));
       members = h("aside", { class: "members" }, order.map((k) => [
         h("div", { class: "side-h" }, k + " — " + groups.get(k).length),
-        groups.get(k).map((m) => h("div", { class: "mem" + (m.status === "active" ? "" : " gone"), title: m.agent_id },
-          avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, m.name), h("span", { class: "ch-sub" }, m.agent_id + (m.role === "read" ? " · read-only" : "")))))]));
+        groups.get(k).map((m) => h("button", { class: "mem" + (m.status === "active" ? "" : " gone"), title: m.agent_id, on: { click: () => openProfile(m.agent_id).catch(fail) } },
+          avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, m.display_name || m.name),
+            h("span", { class: "ch-sub" }, m.status_text || (m.agent_id + (m.role === "read" ? " · read-only" : ""))))))]));
     }
 
     put(main, h("div", { class: "chat" + (r ? " has-room" : "") + (members ? " with-members" : "") }, side, conv, members, chat.forwarding ? forwardPanel(names) : null));
@@ -589,6 +648,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
       if (keepScroll === "older") list.scrollTop = list.scrollHeight - prevFromBottom;
       else if (!keepScroll || atBottom) list.scrollTop = list.scrollHeight;
       else list.scrollTop = list.scrollHeight - prevFromBottom;
+      // Images load after the first layout: stay pinned to the bottom if we were there.
+      for (const img of list.querySelectorAll("img")) if (!img.complete) img.addEventListener("load", () => {
+        if (list.scrollHeight - list.scrollTop - list.clientHeight < img.clientHeight + 120) list.scrollTop = list.scrollHeight;
+      }, { once: true });
     }
     if (typing && $("#chat-input")) { const ni = $("#chat-input"); ni.focus(); ni.setSelectionRange(typing[0], typing[1]); if (chat.pop) mentionPop(ni); }
     else if (r && !keepScroll && innerWidth > 800) $("#chat-input")?.focus();
@@ -611,16 +674,205 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
   async function sendChat() {
     const input = $("#chat-input"); const body = input.value;
-    if (!body.trim() || !chat.current) return;
+    if ((!body.trim() && !chat.pending.length) || !chat.current) return;
+    if (chat.pending.some((x) => !x.id)) return alert("Images are still uploading.");
     input.disabled = true;
     try {
       await api("/api/owner/send", { room: chat.current, body, thread_id: $("#chat-thread").value.trim() || undefined, reply_requested: $("#chat-reply").checked,
-        reply_to: chat.replyTo && chat.replyTo.room === chat.current ? chat.replyTo.id : undefined });
-      chat.replyTo = null;
+        reply_to: chat.replyTo && chat.replyTo.room === chat.current ? chat.replyTo.id : undefined,
+        images: chat.pending.length ? chat.pending.map((x) => x.id) : undefined });
+      chat.replyTo = null; chat.pending = [];
       // A live re-render may have replaced the textarea mid-send: clear whichever one is current.
       for (const el of [input, $("#chat-input")]) if (el && el.value === body) el.value = "";
       await chatLoad(); await chatOpen(chat.current, false);
     } catch (e) { alert(e.message); } finally { const i = $("#chat-input"); if (i) { i.disabled = false; i.focus(); } }
+  }
+
+  // ---- polls
+  function pollCard(m) {
+    const p = m.poll || { options: [], counts: [], voters: 0, mine: [] };
+    const total = p.counts.reduce((a, b) => a + b, 0) || 1;
+    const vote = async (i) => {
+      if (p.closed) return;
+      const mine = new Set(p.mine);
+      const next = p.multi ? (mine.has(i) ? [...mine].filter((x) => x !== i) : [...mine, i]) : (mine.has(i) ? [] : [i]);
+      try { const r = await api("/api/owner/vote", { message_id: m.id, options: next }); m.poll = r.poll; renderChat(true); } catch (e) { alert(e.message); }
+    };
+    const left = p.closes_at && !p.closed ? Math.max(0, p.closes_at - Date.now()) : 0;
+    const leftText = left ? (left > 86400000 ? Math.round(left / 86400000) + "d left" : left > 3600000 ? Math.round(left / 3600000) + "h left" : Math.max(1, Math.round(left / 60000)) + "m left") : "";
+    return h("div", { class: "poll" },
+      h("div", { class: "poll-q" }, md(m.body)),
+      h("div", { class: "muted small" }, p.multi ? "Select one or more" : "Select one"),
+      p.options.map((o, i) => h("button", { class: "poll-opt" + (p.mine.includes(i) ? " mine" : ""), disabled: !!p.closed, on: { click: () => vote(i) } },
+        h("span", { class: "poll-bar", style: "width:" + Math.round((p.counts[i] || 0) * 100 / total) + "%" }),
+        h("span", { class: "poll-label" }, (p.mine.includes(i) ? "✓ " : "") + o), h("span", { class: "poll-n" }, String(p.counts[i] || 0)))),
+      h("div", { class: "muted small" }, p.voters + (p.voters === 1 ? " vote" : " votes"), p.closed ? " · closed" : leftText ? " · " + leftText : ""));
+  }
+  function pollBuilder() {
+    const d = chat.pollDraft;
+    const opt = (i) => h("div", { class: "row" }, h("input", { class: "poll-in", value: d.options[i], placeholder: "Option " + (i + 1), maxlength: 100,
+      on: { input: (e) => { d.options[i] = e.target.value; } } }),
+      d.options.length > 2 ? h("button", { class: "icon-btn", "aria-label": "Remove option", on: { click: () => { d.options.splice(i, 1); renderChat(true); } } }, "✕") : null);
+    return h("div", { class: "poll-build" },
+      h("div", { class: "row" }, h("b", {}, "New poll"), h("span", { class: "grow" }), h("button", { class: "icon-btn", "aria-label": "Close", on: { click: () => { chat.pollDraft = null; renderChat(true); } } }, "✕")),
+      h("input", { class: "poll-in", value: d.q, placeholder: "Ask a question (@mentions work)", maxlength: 300, on: { input: (e) => { d.q = e.target.value; } } }),
+      d.options.map((_, i) => opt(i)),
+      h("div", { class: "row" },
+        d.options.length < 10 ? h("button", { class: "act", on: { click: () => { d.options.push(""); renderChat(true); } } }, "+ Option") : null,
+        h("label", {}, h("input", { type: "checkbox", checked: d.multi, on: { change: (e) => { d.multi = e.target.checked; } } }), " multiple answers"),
+        h("select", { on: { change: (e) => { d.minutes = e.target.value; } } }, [["", "No end"], ["60", "1 hour"], ["1440", "1 day"], ["10080", "1 week"]].map(([v, l]) => h("option", { value: v, selected: d.minutes === v }, l))),
+        h("span", { class: "grow" }),
+        h("button", { class: "act primary", on: { click: async () => {
+          const options = d.options.map((o) => o.trim()).filter(Boolean);
+          if (!d.q.trim() || options.length < 2) return alert("A poll needs a question and at least two options.");
+          try {
+            await api("/api/owner/polls", { room: chat.current, question: d.q.trim(), options, multi: d.multi, duration_minutes: d.minutes ? Number(d.minutes) : undefined,
+              thread_id: $("#chat-thread") && $("#chat-thread").value.trim() || undefined });
+            chat.pollDraft = null; await chatLoad(); await chatOpen(chat.current, false);
+          } catch (e) { alert(e.message); }
+        } } }, "Post poll")));
+  }
+
+  // ---- images
+  const imageUrl = (room, id) => "/api/owner/images/" + room + "/" + id;
+  function imagesOf(m) {
+    const imgs = (m.meta && m.meta.images) || [];
+    if (!imgs.length) return null;
+    return h("div", { class: "imgs" }, imgs.map((im) => h("a", { href: imageUrl(m.room, im.id), target: "_blank", rel: "noopener", title: im.alt || "image" },
+      h("img", { src: imageUrl(m.room, im.id), alt: im.alt || "", loading: "lazy" }))));
+  }
+  async function uploadImages(files) {
+    if (!chat.current) return;
+    for (const f of files.slice(0, 4 - chat.pending.length)) {
+      if (!/^image\/(png|jpeg|webp|gif)$/.test(f.type)) { alert(f.name + ": only PNG, JPEG, WebP or GIF. Share other files as GitHub links."); continue; }
+      if (f.size > 1024 * 1024) { alert(f.name + " is over 1 MB."); continue; }
+      const item = { id: null, preview: URL.createObjectURL(f) };
+      chat.pending.push(item); renderChat(true);
+      try {
+        const res = await fetch("/api/owner/images?room=" + encodeURIComponent(chat.current), { method: "POST", credentials: "same-origin", headers: { "content-type": f.type }, body: f });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.message || data.error);
+        item.id = data.id;
+      } catch (e) { chat.pending.splice(chat.pending.indexOf(item), 1); alert("Upload failed: " + e.message); }
+      renderChat(true);
+    }
+  }
+
+  // ---- GitHub link cards (parsed from the URL; nothing is fetched)
+  function githubCards(body) {
+    const seen = new Set(); const cards = [];
+    for (const mm of String(body || "").matchAll(/https:\/\/github\.com\/([\w.-]+)\/([\w.-]+)(?:\/(pull|issues|commit|blob|tree|releases\/tag)\/([^\s)>\]]+))?/g)) {
+      const url = mm[0].replace(/[.,;:!?'")]+$/, "");
+      if (seen.has(url) || cards.length >= 3) continue;
+      seen.add(url);
+      const kind = mm[3], rest = (mm[4] || "").replace(/[.,;:!?'")]+$/, "");
+      const what = kind === "pull" ? "Pull request #" + rest.split("/")[0] : kind === "issues" ? "Issue #" + rest.split("/")[0]
+        : kind === "commit" ? "Commit " + rest.slice(0, 7) : kind === "blob" || kind === "tree" ? rest.split("/").slice(1).join("/") || rest
+        : kind === "releases/tag" ? "Release " + rest : "Repository";
+      cards.push(h("a", { class: "gh", href: url, target: "_blank", rel: "noopener noreferrer nofollow" },
+        h("span", { class: "gh-mark" }, "GH"), h("span", { class: "ch-text" }, h("b", {}, mm[1] + "/" + mm[2]), h("span", { class: "ch-sub" }, what))));
+    }
+    return cards.length ? h("div", { class: "ghs" }, cards) : null;
+  }
+
+  // ---- profiles
+  const PRESENCE = { online: "Online", reachable: "Reachable by webhook", offline: "Offline", revoked: "Revoked" };
+  async function openProfile(id) {
+    const p = await api("/api/owner/profiles/" + encodeURIComponent(id));
+    if (p.kind === "human") people.set(p.id, { display_name: p.display_name, avatar: p.avatar });
+    const close = () => $("#profile-overlay")?.remove();
+    const mineAgent = p.kind === "agent" && me && p.owner && p.owner.id === me.owner_id;
+    const isMe = p.kind === "human" && me && p.id === me.owner_id;
+    const big = p.avatar ? h("img", { class: "av pbig pic", src: p.avatar, alt: "" }) : avatar(p.id, p.display_name || p.username, "pbig");
+    const section = (title, ...kids) => h("div", { class: "psec" }, h("div", { class: "psec-h" }, title), ...kids);
+    const note = h("textarea", { class: "pnote", rows: 2, placeholder: "Click to add a note", maxlength: 1000 });
+    note.value = p.note || "";
+    const panel = h("div", { class: "overlay", id: "profile-overlay", on: { click: (e) => { if (e.target.id === "profile-overlay") close(); } } },
+      h("div", { class: "panel profile", role: "dialog", "aria-label": "Profile" },
+        h("div", { class: "pbanner", style: "background:" + (p.banner_color || "hsl(" + hue(p.id) + ",35%,55%)") },
+          h("button", { class: "icon-btn pclose", "aria-label": "Close", on: { click: close } }, "✕")),
+        h("div", { class: "phead" },
+          h("span", { class: "pav" }, big, h("span", { class: "pdot " + p.presence.state, title: PRESENCE[p.presence.state] || "" })),
+          p.status_text ? h("span", { class: "pstatus" }, p.status_text) : null),
+        h("div", { class: "pbody" },
+          h("h2", {}, p.display_name || p.username),
+          h("div", { class: "prow" }, h("span", {}, p.username), p.kind === "human" && p.pronouns ? h("span", { class: "muted" }, " · " + p.pronouns) : null,
+            h("span", { class: "pill " + (p.kind === "human" ? "human" : "") }, p.kind === "human" ? "HUMAN" : "AGENT"),
+            p.trust_tier === "external" ? h("span", { class: "pill warn" }, "EXTERNAL") : null,
+            p.model ? h("span", { class: "pill" }, p.model) : null),
+          p.kind === "agent" ? h("div", { class: "muted" }, "Owned by ", h("b", {}, p.owner.display_name || shortOwner(p.owner.id)), " ✓") : null,
+          p.mutual_rooms.length ? h("div", { class: "muted" }, p.mutual_rooms.length + (p.mutual_rooms.length === 1 ? " mutual room" : " mutual rooms")) : null,
+          h("div", { class: "row pactions" },
+            mineAgent && p.status === "active" ? h("button", { class: "act primary", on: { click: async () => {
+              try { const r = await api("/api/owner/dm", { agent_id: p.id }); close(); show("threads"); await chatLoad(); chat.thread = ""; await chatOpen(r.room); } catch (e) { alert(e.message); }
+            } } }, "Message") : null,
+            mineAgent || isMe ? h("button", { class: "act", on: { click: () => { close(); editProfile(p).catch(fail); } } }, "Edit profile") : null),
+          p.bio ? section("Bio", md(p.bio)) : null,
+          p.kind === "agent" && (p.role || p.runtime || p.capabilities.length) ? section("About",
+            p.role ? h("div", {}, h("span", { class: "muted" }, "Role: "), p.role) : null,
+            p.runtime ? h("div", {}, h("span", { class: "muted" }, "Runs on: "), p.runtime) : null,
+            p.capabilities.length ? h("div", { class: "caps" }, p.capabilities.map((c) => h("span", { class: "pill" }, c))) : null) : null,
+          section("Member since", h("div", {}, new Date(p.member_since).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })),
+            p.presence.last_seen_at && p.presence.state !== "online" ? h("div", { class: "muted small" }, "Last seen " + fmtTime(p.presence.last_seen_at)) : null),
+          section("Connections", p.connections.map((c) => h("a", { class: "conn", href: c.url, target: "_blank", rel: "noopener noreferrer" },
+              h("span", { class: "gh-mark" }, "GH"), h("b", {}, c.login), c.verified ? h("span", { title: c.via === "owner" ? "Verified: its owner signed in with GitHub" : "Verified by GitHub sign-in" }, " ✓") : null,
+              h("span", { class: "muted small" }, c.via === "owner" ? " · owner" : ""))),
+            p.links.map((l) => h("a", { class: "conn", href: l.url, target: "_blank", rel: "noopener noreferrer nofollow ugc" }, h("span", { class: "gh-mark" }, "↗"), h("b", {}, l.label), h("span", { class: "muted small" }, " " + new URL(l.url).hostname)))),
+          p.mutual_rooms.length ? section("Mutual rooms", p.mutual_rooms.map((r) => h("button", { class: "ch", on: { click: async () => { close(); show("threads"); chat.thread = ""; await chatLoad(); await chatOpen(r.id); } } },
+            h("span", { class: "hash" }, r.kind === "dm" ? "@" : "#"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, r.kind === "dm" ? "Direct message" : r.name))))) : null,
+          isMe ? null : section("Note (only visible to you)", note))));
+    note.addEventListener("blur", () => { if (note.value !== (p.note || "")) api("/api/owner/notes/" + encodeURIComponent(p.id), { note: note.value }).then((r) => { p.note = r.note; }).catch((e) => alert(e.message)); });
+    close(); document.body.append(panel);
+  }
+
+  async function editProfile(p) {
+    const isAgent = p.kind === "agent";
+    const base = isAgent ? "/api/owner/agents/" + p.id : "/api/owner";
+    const f = (label, key, attrs = {}) => h("label", { class: "pf" }, h("span", {}, label), h(attrs.tag || "input", { name: key, value: attrs.tag ? undefined : (p[key] || ""), maxlength: attrs.max || 64, ...(attrs.extra || {}) }));
+    const bio = h("textarea", { name: "bio", rows: 4, maxlength: 1000 }); bio.value = p.bio || "";
+    const links = p.links.concat(Array(5 - p.links.length).fill({ label: "", url: "" })).slice(0, 5);
+    const close = () => $("#profile-overlay")?.remove();
+    const avStatus = h("span", { class: "muted small", role: "status" });
+    const form = h("div", { class: "pform" },
+      f("Display name", "display_name"),
+      f("Status", "status_text", { max: 128 }),
+      isAgent ? null : f("Pronouns", "pronouns", { max: 32 }),
+      h("label", { class: "pf" }, h("span", {}, "Bio (Markdown)"), bio),
+      h("label", { class: "pf" }, h("span", {}, "Banner colour"), h("input", { name: "banner_color", type: "color", value: p.banner_color || "#5b8bd0" })),
+      isAgent ? f("Role", "role") : null,
+      isAgent ? h("label", { class: "pf" }, h("span", {}, "Model"), h("select", { name: "model" }, h("option", { value: "" }, "—"),
+        ["Claude", "Gemini", "ChatGPT", "Llama", "Mistral", "Grok", "DeepSeek", "Qwen", "Other"].map((m) => h("option", { value: m, selected: p.model === m }, m)))) : null,
+      isAgent ? f("Runs on", "runtime") : null,
+      isAgent ? h("label", { class: "pf" }, h("span", {}, "Capabilities (comma-separated)"), h("input", { name: "capabilities", value: (p.capabilities || []).join(", ") })) : null,
+      h("div", { class: "pf" }, h("span", {}, "Links (https)"), links.map((l, i) => h("div", { class: "row" },
+        h("input", { name: "link-label-" + i, value: l.label, placeholder: "Label", maxlength: 32, style: "width:8em" }),
+        h("input", { name: "link-url-" + i, value: l.url, placeholder: "https://…", style: "flex:1" })))),
+      h("div", { class: "pf" }, h("span", {}, "Avatar (PNG/JPEG/WebP/GIF ≤ 256 KB)"), h("div", { class: "row" },
+        h("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif", on: { change: async (e) => {
+          const file = e.target.files[0]; if (!file) return;
+          avStatus.textContent = "Uploading…";
+          const res = await fetch(base + "/avatar", { method: "PUT", credentials: "same-origin", headers: { "content-type": file.type || "image/png" }, body: file });
+          const data = await res.json().catch(() => ({}));
+          avStatus.textContent = res.ok ? "Avatar updated ✓" : "Upload failed: " + (data.message || data.error || res.status);
+        } } }),
+        h("button", { class: "act", on: { click: async () => {
+          const res = await fetch(base + "/avatar", { method: "DELETE", credentials: "same-origin", headers: { "content-type": "application/json" } });
+          avStatus.textContent = res.ok ? "Avatar removed" : "Couldn't remove it";
+        } } }, "Remove"), avStatus)));
+    const save = async () => {
+      const v = (k) => { const el = form.querySelector("[name=" + k + "]"); return el ? el.value : undefined; };
+      const body = { display_name: v("display_name"), status_text: v("status_text"), bio: bio.value, banner_color: v("banner_color") };
+      if (isAgent) Object.assign(body, { role: v("role"), model: v("model"), runtime: v("runtime"),
+        capabilities: (v("capabilities") || "").split(",").map((x) => x.trim()).filter(Boolean) });
+      else body.pronouns = v("pronouns");
+      body.links = links.map((_, i) => ({ label: v("link-label-" + i), url: (v("link-url-" + i) || "").trim() })).filter((l) => l.url);
+      try { await api(base + "/profile", body); close(); people.delete(p.id); await chatLoad().catch(() => {}); await openProfile(p.id); } catch (e) { alert(e.message); }
+    };
+    close();
+    document.body.append(h("div", { class: "overlay", id: "profile-overlay", on: { click: (e) => { if (e.target.id === "profile-overlay") close(); } } },
+      h("div", { class: "panel", role: "dialog", "aria-label": "Edit profile" },
+        h("div", { class: "row" }, h("b", {}, "Edit profile · " + (p.display_name || p.username)), h("span", { class: "grow" }), h("button", { class: "icon-btn", "aria-label": "Close", on: { click: close } }, "✕")),
+        form, h("div", { class: "row" }, h("span", { class: "grow" }), h("button", { class: "act", on: { click: close } }, "Cancel"), h("button", { class: "act primary", on: { click: save } }, "Save")))));
   }
 
   // ---- @mention autocomplete
@@ -789,6 +1041,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const revoked = agents.filter((a) => a.status !== "active");
       const out = h("div", {});
       const row = (a) => h("div", { class: "card" + (a.status === "active" ? "" : " muted") }, h("b", {}, a.name), " ", h("code", {}, a.id), " · ", a.status,
+        h("button", { class: "act", on: { click: () => openProfile(a.id).catch(fail) } }, "Profile"),
         " · enrolled ", when(a.created_at), a.rotated_at ? " · token rotated " + when(a.rotated_at) : "",
         a.status === "active" ? h("button", { class: "act danger", on: { click: async () => {
           if (!confirm("Revoke " + a.name + "? Its token stops working, its sockets close and its webhooks are deleted.")) return;
@@ -848,7 +1101,9 @@ export const DASHBOARD_JS = String.raw`"use strict";
       me = await api("/api/owner/me");
       const perm = "Notification" in window ? Notification.permission : "unsupported";
       put(main, 
-        h("div", { class: "card" }, h("h3", {}, "Signed in as"), h("p", {}, h("b", {}, me.owner_id), " ", me.email ? "(" + me.email + ")" : "")),
+        h("div", { class: "card" }, h("h3", {}, "Signed in as"), h("p", {}, h("b", {}, me.owner_id), " ", me.email ? "(" + me.email + ")" : ""),
+          h("button", { class: "act", on: { click: () => openProfile(me.owner_id).catch(fail) } }, "View your profile"),
+          h("button", { class: "act", on: { click: async () => editProfile(await api("/api/owner/profiles/" + encodeURIComponent(me.owner_id))).catch(fail) } }, "Edit your profile")),
         h("div", { class: "card" }, h("h3", {}, "Phone pushes (ntfy)"),
           h("p", {}, "Subscribe to this topic in the ntfy app. Pushes only say that something is waiting, never what."),
           h("pre", {}, (me.ntfy_base || "https://ntfy.sh") + "/" + (me.ntfy_topic || "(none)")),

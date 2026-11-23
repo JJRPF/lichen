@@ -43,11 +43,16 @@ export async function authAgent(req: Request, env: Env): Promise<Agent> {
   const hash = await sha256Hex(token);
   // Rate-limit by token hash before touching D1, so a bad token is cheap too.
   await rateLimit(env, `tok:${hash}`);
-  const agent = await env.DB.prepare(
-    "SELECT id, owner_id, name FROM agents WHERE token_hash = ? AND status = 'active'",
-  ).bind(hash).first<Agent>();
-  if (!agent) throw new HttpError(401, "unauthorized", "Unknown or revoked token");
-  return agent;
+  const row = await env.DB.prepare(
+    "SELECT id, owner_id, name, last_seen_at FROM agents WHERE token_hash = ? AND status = 'active'",
+  ).bind(hash).first<Agent & { last_seen_at: number | null }>();
+  if (!row) throw new HttpError(401, "unauthorized", "Unknown or revoked token");
+  // "Last seen" for profiles, written at most once a minute.
+  const now = Date.now();
+  if (!row.last_seen_at || now - row.last_seen_at > 60_000) {
+    await env.DB.prepare("UPDATE agents SET last_seen_at = ? WHERE id = ?").bind(now, row.id).run();
+  }
+  return { id: row.id, owner_id: row.owner_id, name: row.name };
 }
 
 export function isAdmin(req: Request, env: Env): boolean {
@@ -202,13 +207,13 @@ export function checkBodySize(env: Env, text: string) {
 export interface Sent { id: string; room: string; seq: number; created_at: number; thread_paused: boolean }
 
 /** Append a message as `sender` and notify the room. Membership must already be checked (fanout). */
-export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: string, meta: MessageMeta): Promise<Sent> {
+export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: string, meta: MessageMeta, kind: "message" | "poll" = "message"): Promise<Sent> {
   const { env } = ctx;
   const envelope: Envelope = { sender_id: sender.id, sender_owner_id: sender.owner_id };
   const res = await room(env, fanout.roomId).sendMessage(envelope, text, meta, {
     turnCap: Number(env.TURN_CAP ?? 10),
     cooldownMs: Number(env.COOLDOWN_MS ?? 2000),
-  }, fanout);
+  }, stripMembers(fanout), kind);
   if (!res.ok) {
     if (res.error === "thread_paused") {
       throw new HttpError(409, "thread_paused", "Turn cap reached; an owner must resume this thread");
@@ -239,11 +244,14 @@ export async function ownerFanout(env: Env, ownerId: string, roomId: string): Pr
   return fanoutFor(roomId, rows, null);
 }
 
-export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, text: string, meta: MessageMeta, fanout?: RoomFanout): Promise<Sent> {
+/** The room DO only needs who to notify, not member names. */
+const stripMembers = (f: Fanout): Fanout => ({ roomId: f.roomId, recipients: f.recipients, owners: f.owners, direct: f.direct });
+
+export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, text: string, meta: MessageMeta, fanout?: RoomFanout, kind: "message" | "poll" = "message"): Promise<Sent> {
   const { env } = ctx;
   checkBodySize(env, text);
   fanout ??= await ownerFanout(env, ownerId, roomId);
-  const res = await room(env, roomId).sendHuman({ sender_id: ownerId, sender_owner_id: ownerId }, text, meta, fanout);
+  const res = await room(env, roomId).sendHuman({ sender_id: ownerId, sender_owner_id: ownerId }, text, meta, stripMembers(fanout), kind);
   const id = `${roomId}:${res.seq}`;
   await audit(env, ownerId, "owner.send", id, { thread_id: meta.thread_id ?? null, bytes: text.length });
   return { id, room: roomId, seq: res.seq, created_at: res.created_at, thread_paused: false };
@@ -265,7 +273,7 @@ export function present(viewerOwner: string, roomId: string, m: StoredMessage, v
     return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
   }
   const attention = viewer && m.sender_id !== viewer.agentId ? attentionFor(viewer.agentId, viewer.direct, m.meta) : undefined;
-  return { ...base, body: m.body, meta: m.meta, no_turn: false, ...(attention ? { attention } : {}) };
+  return { ...base, body: m.body, meta: m.meta, ...(m.poll ? { poll: m.poll } : {}), no_turn: false, ...(attention ? { attention } : {}) };
 }
 
 export async function readHistory(env: Env, viewerOwner: string, roomId: string, url: URL, viewer?: { agentId: string; direct: boolean }) {
@@ -278,6 +286,7 @@ export async function readHistory(env: Env, viewerOwner: string, roomId: string,
     beforeSeq: before ? Number(before) : after ? undefined : Number.MAX_SAFE_INTEGER,
     threadId: thread ?? undefined,
     limit,
+    voterId: viewer?.agentId ?? viewerOwner,
   });
   return { room: roomId, messages: msgs.map((m) => present(viewerOwner, roomId, m, viewer)) };
 }
