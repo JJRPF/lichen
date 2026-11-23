@@ -10,7 +10,8 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  checkUrl, cursorFor, decodeCursor, encodeCursor, fence, oneLine, parseNotice, renderInbox, hooksSnippet, preToolUseHook,
+  checkUrl, cursorFor, decodeCursor, encodeCursor, fence, oneLine, parseNotice, renderInbox, hooksSnippet, preToolUseHook, pendingLine,
+  isTurn as isTurnExport,
 } from "../lib.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "lichen.mjs");
@@ -40,7 +41,7 @@ before(async () => {
       const send0 = (status, data) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
       if (!url.pathname.startsWith("/api/")) return send0(404, { error: "not_found", message: "The API is under /api/" });
       url.pathname = url.pathname.slice(4);
-      requests.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), auth: req.headers.authorization, body: body ? JSON.parse(body) : undefined });
+      requests.push({ method: req.method, path: url.pathname, query: Object.fromEntries(url.searchParams), auth: req.headers.authorization, body: body ? (() => { try { return JSON.parse(body); } catch { return { raw_bytes: Buffer.byteLength(body) }; } })() : undefined });
       const send = (status, data) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(data)); };
       if (failNext) { failNext = false; return send(500, { error: "internal_error" }); }
       if (url.pathname === "/enroll") {
@@ -54,6 +55,12 @@ before(async () => {
       if (url.pathname === "/dm") return send(202, { status: "pending", approval_id: "apr_x", approval_url: "https://lichen.test/approvals#apr_x" });
       if (url.pathname === "/webhooks") return send(req.method === "POST" ? 201 : 200, { ok: true });
       if (url.pathname.startsWith("/webhooks/")) return send(200, { ok: true });
+      if (url.pathname === "/polls") return send(201, { id: "r_a:5" });
+      if (url.pathname === "/vote") return send(200, { id: "r_a:5", poll: { counts: [1, 0] } });
+      if (url.pathname === "/images" && req.method === "POST") return send(201, { id: "img_0123456789abcdef" });
+      if (url.pathname.startsWith("/images/")) { res.writeHead(200, { "content-type": "image/png" }); return res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47])); }
+      if (url.pathname === "/me/profile" || url.pathname.startsWith("/profiles/")) return send(200, { id: "agt_me", kind: "agent" });
+      if (url.pathname === "/me/avatar") return send(200, { ok: true, avatar: "x" });
       if (url.pathname === "/forward") return send(201, { id: "r_b:2" });
       if (url.pathname === "/agents") return send(200, { agents: [], q: url.searchParams.get("q") });
       if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
@@ -450,5 +457,67 @@ describe("attention", () => {
   test("notices keep attention", () => {
     assert.equal(parseNotice('{"id":"r_a:1","room":"r_a","from":"x","trust_tier":"same_owner","attention":"mention"}').attention, "mention");
     assert.equal(parseNotice('{"id":"r_a:1","room":"r_a","from":"x","trust_tier":"same_owner","attention":"bogus"}').attention, undefined);
+  });
+});
+
+describe("watch: catching up on connect", () => {
+  test("flags messages and DM requests that were already waiting", () => {
+    assert.equal(pendingLine({ messages: [], approvals: [] }), null);
+    const line = pendingLine({
+      messages: [msg("r_a", 1, { attention: "direct" }), msg("r_a", 2, { attention: "ambient" }), reaction("r_a", 3, 1)],
+      approvals: [{ id: "apr_1", direction: "incoming", status: "pending" }], more: true,
+    });
+    assert.deepEqual(line, { kind: "pending", unread: 3, needs_reply: 1, ids: ["r_a:1", "r_a:2", "r_a:3"], approvals: 1, more: true });
+    assert.deepEqual(pendingLine({ messages: [], approvals: [{ id: "apr_2", direction: "incoming", status: "pending" }] }),
+      { kind: "pending", unread: 0, needs_reply: 0, ids: [], approvals: 1 });
+  });
+});
+
+describe("polls, images, profiles", () => {
+  test("poll and vote map to the API", async () => {
+    await run(["poll", "r_a", "Which format?", "Parquet", "Arrow", "--multi", "--minutes", "60"]);
+    await run(["vote", "r_a:5", "0,1"]);
+    await run(["vote", "r_a:5", "none"]);
+    assert.deepEqual(requests[0].body, { room: "r_a", question: "Which format?", options: ["Parquet", "Arrow"], multi: true, duration_minutes: 60 });
+    assert.deepEqual(requests[1].body, { message_id: "r_a:5", options: [0, 1] });
+    assert.deepEqual(requests[2].body, { message_id: "r_a:5", options: [] });
+    assert.equal((await run(["poll", "r_a", "q", "only-one"])).code, 1);
+  });
+
+  test("send --image uploads first, then attaches the ids; image downloads to a file", async () => {
+    const img = join(home, "shot.png");
+    writeFileSync(img, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]));
+    const r = await run(["send", "r_a", "see screenshot", "--image", img]);
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(requests.map((q) => `${q.method} ${q.path}`), ["POST /images", "POST /send"]);
+    assert.equal(requests[0].query.room, "r_a");
+    assert.deepEqual(requests[1].body.images, ["img_0123456789abcdef"]);
+    const out = join(home, "got.png");
+    await run(["image", "r_a", "img_0123456789abcdef", out]);
+    assert.deepEqual([...readFileSync(out)], [0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  test("profile show/set and avatar", async () => {
+    await run(["profile"]);
+    await run(["profile", "github:someone"]);
+    await run(["profile", "set", "name=Kernel Bot", "model=Claude", "capabilities=review, tests", "status="]);
+    assert.deepEqual(requests.map((q) => `${q.method} ${q.path}`), ["GET /me/profile", "GET /profiles/github%3Asomeone", "PATCH /me/profile"]);
+    assert.deepEqual(requests[2].body, { display_name: "Kernel Bot", model: "Claude", capabilities: ["review", "tests"], status_text: null });
+    assert.equal((await run(["profile", "set", "pronouns=they"])).code, 1);
+    const img = join(home, "a.png"); writeFileSync(img, Buffer.from([0x89, 0x50]));
+    await run(["avatar", img]);
+    assert.equal(requests.at(-1).path, "/me/avatar");
+  });
+
+  test("renders polls and image placeholders without bytes", () => {
+    const { text } = renderInbox({ messages: [
+      msg("r_a", 1, { kind: "poll", body: "Which format?", attention: "mention",
+        poll: { options: ["Parquet", "Arrow"], multi: false, counts: [2, 1], voters: 3, mine: [0], closed: false } }),
+      msg("r_a", 2, { body: "screenshot", meta: { reply_requested: true, images: [{ id: "img_0123456789abcdef", type: "image/png", size: 2048, alt: "build graph" }] } }),
+    ], cursor: "" });
+    assert.match(text, /poll \(3 voted; vote: `lichen vote r_a:1 <n>`\)/);
+    assert.match(text, /0\. Parquet \(2\) ← your vote/);
+    assert.match(text, /\[image `img_0123456789abcdef` "build graph" \(image\/png, 2 KB\): fetch only if needed with `lichen image r_a img_0123456789abcdef <file>`\]/);
+    assert.equal(isTurnExport({ kind: "poll", meta: { reply_requested: true }, attention: "direct" }), true);
   });
 });

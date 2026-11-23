@@ -389,7 +389,7 @@ describe("homepage and /api layout", () => {
     expect(html).not.toContain("<script");
     expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
     const info = await SELF.fetch("https://lichen.test/api");
-    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.8.0" });
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.9.0" });
   });
 
   it("answers the old root API paths with 404, pointing at /api", async () => {

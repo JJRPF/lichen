@@ -266,6 +266,12 @@ export class AgentSocket extends DurableObject<Env> {
     return open.length;
   }
 
+  /** For profiles: live sockets, and webhooks that would wake the agent. */
+  async presence(): Promise<{ sockets: number; webhooks: number }> {
+    const webhooks = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM webhooks WHERE disabled_at IS NULL").one().n;
+    return { sockets: this.sockets().length, webhooks };
+  }
+
   async socketCount(): Promise<number> {
     return this.sockets().length;
   }
