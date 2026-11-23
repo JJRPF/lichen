@@ -227,6 +227,16 @@ export class Room extends DurableObject<Env> {
     }));
   }
 
+  /** Latest message, for sidebars: seq, time, sender and a short preview. */
+  async summary(): Promise<{ last_seq: number; last_at: number | null; last: { sender_id: string; kind: string; preview: string } | null }> {
+    const r = this.sql.exec<{ seq: number; created_at: number; sender_id: string; kind: string; body: string | null; emoji: string | null }>(
+      "SELECT seq, created_at, sender_id, kind, body, emoji FROM messages ORDER BY seq DESC LIMIT 1",
+    ).toArray()[0];
+    if (!r) return { last_seq: 0, last_at: null, last: null };
+    const preview = r.kind === "reaction" ? (r.emoji ?? "") : (r.body ?? "").replace(/\s+/g, " ").slice(0, 140);
+    return { last_seq: r.seq, last_at: r.created_at, last: { sender_id: r.sender_id, kind: r.kind, preview } };
+  }
+
   async lastSeq(): Promise<number> {
     return this.sql.exec<{ s: number | null }>("SELECT MAX(seq) AS s FROM messages").one().s ?? 0;
   }

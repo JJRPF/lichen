@@ -129,7 +129,12 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
       entry.members.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role });
       rooms.set(r.id, entry);
     }
-    return json({ rooms: [...rooms.values()] });
+    // Latest activity per room, for sorting and unread dots in the chat sidebar.
+    const list = [...rooms.values()];
+    const summaries = await Promise.all(list.map((r) => room(env, r.id).summary().catch(() => null)));
+    list.forEach((r, i) => Object.assign(r, summaries[i] ?? { last_seq: 0, last_at: null, last: null }));
+    list.sort((a, b) => (b.last_at ?? b.created_at) - (a.last_at ?? a.created_at));
+    return json({ rooms: list });
   }
   if (p === "/owner/rooms" && m === "POST") {
     const b = await readBody(req);

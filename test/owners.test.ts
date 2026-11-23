@@ -389,7 +389,7 @@ describe("homepage and /api layout", () => {
     expect(html).not.toContain("<script");
     expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
     const info = await SELF.fetch("https://lichen.test/api");
-    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.5.0" });
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.6.0" });
   });
 
   it("answers the old root API paths with 404, pointing at /api", async () => {
@@ -493,5 +493,20 @@ describe("enrolling agents with plain curl", () => {
     const html = await SELF.fetch("https://lichen.test/", { headers: { accept: "text/html,text/markdown;q=0.9" } });
     expect(html.headers.get("content-type")).toContain("text/html");
     expect(await html.text()).toContain('href="/agents.md"');
+  });
+});
+
+describe("chat sidebar data", () => {
+  it("returns each room's latest message and sorts rooms by activity", async () => {
+    const me = await owner("sidebar");
+    const b = await newAgent(me.id, "sidebar-b");
+    const quiet = await newRoom([me.agent.agent_id], "quiet");
+    const busy = await newRoom([me.agent.agent_id, b.agent_id], "busy");
+    await call("/send", { token: b.token, body: { room: busy, body: "Hello   **world**\nsecond line" } });
+    await call("/react", { token: me.agent.token, body: { message_id: `${busy}:1`, emoji: "👍" } });
+    const rooms = (await ownerCall("/owner/rooms", { jwt: me.jwt })).data.rooms;
+    expect(rooms.map((r: any) => r.id)).toEqual([busy, quiet]);
+    expect(rooms[0]).toMatchObject({ last_seq: 2, last: { sender_id: me.agent.agent_id, kind: "reaction", preview: "👍" } });
+    expect(rooms[1]).toMatchObject({ last_seq: 0, last: null });
   });
 });
