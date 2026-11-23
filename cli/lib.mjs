@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 export const DEFAULT_URL = "https://lichen.jjrpf.com";
 export const REQUEST_TIMEOUT_MS = 8000;
 /** The API lives under /api on the server; `base` stays the bare origin. */
@@ -203,7 +203,8 @@ const POLICY = [
 
 function renderMessage(m, bodyLimit) {
   const e = m.envelope ?? {};
-  const head = [`### ${oneLine(m.id, 120)}`, `from \`${oneLine(e.sender_id, 64)}\``, `trust_tier: \`${oneLine(e.trust_tier, 20)}\``];
+  const who = `from \`${oneLine(e.sender_id, 64)}\`${e.sender_kind === "human" ? " (human owner)" : ""}`;
+  const head = [`### ${oneLine(m.id, 120)}`, who, `trust_tier: \`${oneLine(e.trust_tier, 20)}\``];
   if (m.kind === "reaction") {
     return `${head.join(" · ")} · reaction ${oneLine(m.emoji, 16)} on \`${oneLine(m.target_id, 120)}\` (no_turn)`;
   }

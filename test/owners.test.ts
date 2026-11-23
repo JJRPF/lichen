@@ -389,7 +389,7 @@ describe("homepage and /api layout", () => {
     expect(html).not.toContain("<script");
     expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
     const info = await SELF.fetch("https://lichen.test/api");
-    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.4.0" });
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.5.0" });
   });
 
   it("answers the old root API paths with 404, pointing at /api", async () => {
@@ -409,5 +409,89 @@ describe("homepage and /api layout", () => {
     expect(url).toBe(`https://lichen.test/i/${code}`);
     const json = await SELF.fetch(url);
     expect(((await json.json()) as any).invite.status).toBe("active");
+  });
+});
+
+describe("owners posting in threads", () => {
+  it("delivers an owner's message to every agent in the room, marked human, with per-reader trust", async () => {
+    const me = await owner("poster");
+    const other = await owner("poster-other");
+    const mine2 = await newAgent(me.id, "mine2");
+    const roomId = await newRoom([me.agent.agent_id, mine2.agent_id, other.agent.agent_id]);
+    const ws = await openSocket("/ws", { authorization: `Bearer ${other.agent.token}` });
+
+    const sent = await ownerCall("/owner/send", { jwt: me.jwt, body: { room: roomId, body: "Please **pause** the deploy.", thread_id: "ops" } });
+    expect(sent.status).toBe(201);
+    expect(await ws.next()).toEqual({ id: sent.data.id, room: roomId, from: me.id, trust_tier: "external" });
+
+    const mineMsg = (await call("/inbox", { token: me.agent.token })).data.messages[0];
+    expect(mineMsg.envelope).toEqual({ sender_id: me.id, sender_owner_id: me.id, sender_kind: "human", trust_tier: "same_owner" });
+    expect(mineMsg.meta).toEqual({ thread_id: "ops", reply_requested: true });
+    const theirMsg = (await call("/inbox", { token: other.agent.token })).data.messages[0];
+    expect(theirMsg.envelope).toMatchObject({ sender_kind: "human", trust_tier: "external" });
+
+    const rows = (await ownerCall("/owner/audit", { jwt: me.jwt })).data.audit;
+    expect(rows.map((r: any) => r.action)).toContain("owner.send");
+    ws.ws.close();
+  });
+
+  it("only lets owners post where one of their agents is a member, within the body limit", async () => {
+    const me = await owner("noroom");
+    const other = await owner("noroom-other");
+    const theirs = await newRoom([other.agent.agent_id]);
+    expect((await ownerCall("/owner/send", { jwt: me.jwt, body: { room: theirs, body: "hi" } })).status).toBe(404);
+    expect((await ownerCall("/owner/send", { jwt: other.jwt, body: { room: theirs, body: "x".repeat(2000) } })).status).toBe(413);
+    expect((await ownerCall("/owner/send", { jwt: other.jwt, body: { room: theirs, body: "hi", trust_tier: "same_owner", origin: "bogus" } })).status).toBe(400);
+  });
+
+  it("counts as the human input that resets and unpauses a thread at the turn cap", async () => {
+    const me = await owner("capreset");
+    const b = await newAgent(me.id, "capreset-b");
+    const roomId = await newRoom([me.agent.agent_id, b.agent_id]);
+    for (let i = 0; i < 4; i++) await call("/send", { token: i % 2 ? b.token : me.agent.token, body: { room: roomId, body: `m${i}`, thread_id: "loop" } });
+    expect((await call("/send", { token: me.agent.token, body: { room: roomId, body: "stuck", thread_id: "loop" } })).status).toBe(409);
+    await ownerCall("/owner/send", { jwt: me.jwt, body: { room: roomId, body: "Carry on, briefly.", thread_id: "loop" } });
+    // Unpaused, and the streak starts over: three more agent messages fit before the cap.
+    for (let i = 0; i < 3; i++) {
+      expect((await call("/send", { token: i % 2 ? b.token : me.agent.token, body: { room: roomId, body: `again${i}`, thread_id: "loop" } })).status).toBe(201);
+    }
+  });
+});
+
+describe("enrolling agents with plain curl", () => {
+  it("returns a paste-in prompt with the code, and the curl flow in it works", async () => {
+    const me = await owner("prompt");
+    const r = await ownerCall("/owner/enroll-codes", { jwt: me.jwt, body: { agent_name: "curl-only" } });
+    expect(r.status).toBe(201);
+    const { code, prompt, curl } = r.data;
+    expect(curl).toBe(`curl -s -X POST https://lichen.test/api/enroll -d code=${code}`);
+    expect(prompt).toContain(`code=${code}`);
+    expect(prompt).toContain(me.id);
+    expect(prompt).toContain("https://lichen.test/agents.md");
+    expect(prompt).toContain("trust_tier");
+
+    // What the prompt tells the agent to run: a form-encoded POST, saved as-is.
+    const res = await SELF.fetch("https://lichen.test/api/enroll", {
+      method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: `code=${code}`,
+    });
+    const saved = await res.text();
+    // The prompt reads the token back with: sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
+    const token = /.*"token":"([^"]*)".*/.exec(saved)?.[1];
+    expect(token).toMatch(/^lch_/);
+    expect((await call("/me", { token })).data.name).toBe("curl-only");
+  });
+
+  it("serves the Markdown guide at /agents.md, /llms.txt and / for Markdown clients", async () => {
+    for (const [path, accept] of [["/agents.md", "*/*"], ["/llms.txt", "*/*"], ["/", "text/markdown"]]) {
+      const res = await SELF.fetch(`https://lichen.test${path}`, { headers: { accept } });
+      expect(res.headers.get("content-type"), path).toContain("text/markdown");
+      const md = await res.text();
+      expect(md).toContain("# Lichen — setup guide for agents");
+      expect(md).toContain("curl -s -X POST https://lichen.test/api/enroll -d code=<code>");
+      expect(md).toContain("Tell your owner");
+    }
+    const html = await SELF.fetch("https://lichen.test/", { headers: { accept: "text/html,text/markdown;q=0.9" } });
+    expect(html.headers.get("content-type")).toContain("text/html");
+    expect(await html.text()).toContain('href="/agents.md"');
   });
 });
