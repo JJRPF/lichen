@@ -12,10 +12,10 @@
 import { accessConfigured, accessToken, verifyAccess } from "./access";
 import {
   type Ctx, type Owner, agentHub, audit, connect, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
-  cleanMeta, rateLimit, readHistory, room, sendAsOwner,
+  cleanMeta, ownerFanout, prepareMeta, rateLimit, readHistory, room, sendAsOwner,
 } from "./core";
 import { ownerHubName } from "./env";
-import { acceptInvite, createInvite, createRoom, decideApproval, findInvite } from "./social";
+import { acceptInvite, forwardMessage, humanDm, createInvite, createRoom, decideApproval, findInvite } from "./social";
 import { DASHBOARD_JS, dashboardPage } from "./pages";
 import { HttpError, json, readBody, str } from "./util";
 
@@ -133,13 +133,13 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const ids = await ownerRoomIds(env, owner.id);
     if (!ids.length) return json({ rooms: [] });
     const { results } = await env.DB.prepare(
-      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role
+      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role
        FROM rooms r JOIN memberships m ON m.room_id = r.id JOIN agents a ON a.id = m.agent_id
        WHERE r.id IN (${ids.map(() => "?").join(",")}) ORDER BY r.created_at`,
     ).bind(...ids).all<Record<string, any>>();
     const rooms = new Map<string, any>();
     for (const r of results) {
-      const entry = rooms.get(r.id) ?? { id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at, members: [] };
+      const entry = rooms.get(r.id) ?? { id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at, human_owner: r.human_owner, members: [] };
       entry.members.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role });
       rooms.set(r.id, entry);
     }
@@ -171,7 +171,16 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const b = await readBody(req);
     const roomId = str(b.room, "room", 64, true)!;
     const text = str(b.body, "body", 1_000_000, true)!;
-    return json(await sendAsOwner(ctx, owner.id, roomId, text, cleanMeta(b)), 201);
+    const fanout = await ownerFanout(env, owner.id, roomId);
+    const meta = await prepareMeta(env, fanout, owner.id, text, b, cleanMeta(b));
+    return json(await sendAsOwner(ctx, owner.id, roomId, text, meta, fanout), 201);
+  }
+  if (p === "/owner/forward" && m === "POST") {
+    return json(await forwardMessage(ctx, { ownerId: owner.id }, await readBody(req)), 201);
+  }
+  if (p === "/owner/dm" && m === "POST") {
+    // Open a direct conversation between you and one of your agents.
+    return json(await humanDm(ctx, owner.id, str((await readBody(req)).agent_id, "agent_id", 64, true)!));
   }
   if (p === "/owner/history" && m === "GET") {
     const roomId = url.searchParams.get("room") ?? "";

@@ -1,8 +1,8 @@
 // Shared pieces of the Worker: auth, membership, sending, owner notices.
 
 import type { Envelope, Fanout, MessageMeta, StoredMessage } from "./room";
-import { ownerHubName, tierFor, type Env, type LiveEvent, type TrustTier } from "./env";
-import { HttpError, randomString, safeEqual, sha256Hex, str, bool } from "./util";
+import { attentionFor, ownerHubName, tierFor, type Env, type LiveEvent, type TrustTier } from "./env";
+import { HttpError, parseMessageId, randomString, safeEqual, sha256Hex, str, bool } from "./util";
 import { agentPrompt } from "./guide";
 
 const ENROLL_CODE_TTL_S = 24 * 60 * 60;
@@ -71,45 +71,110 @@ export const room = (env: Env, roomId: string) => env.ROOM.get(env.ROOM.idFromNa
 export const agentHub = (env: Env, agentId: string) => env.AGENT.get(env.AGENT.idFromName(agentId));
 export const ownerHub = (env: Env, ownerId: string) => env.AGENT.get(env.AGENT.idFromName(ownerHubName(ownerId)));
 
-export interface MembershipRow { room_id: string; name: string; kind: string; role: string; last_read_seq: number }
+export interface MembershipRow {
+  room_id: string; name: string; kind: string; role: string; last_read_seq: number;
+  human_owner: string | null; members: number;
+}
+
+const MEMBERSHIP_COLS = `m.room_id, r.name, r.kind, m.role, m.last_read_seq, r.human_owner,
+  (SELECT COUNT(*) FROM memberships x JOIN agents ax ON ax.id = x.agent_id WHERE x.room_id = m.room_id AND ax.status = 'active') AS members`;
+
+/** Every message in a DM, a human↔agent DM, or a two-member room is "direct". */
+export const isDirect = (r: { kind: string; human_owner: string | null; members: number }) =>
+  r.kind === "dm" || !!r.human_owner || r.members <= 2;
 
 export async function memberships(env: Env, agentId: string): Promise<MembershipRow[]> {
   const { results } = await env.DB.prepare(
-    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
-     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? ORDER BY r.created_at`,
+    `SELECT ${MEMBERSHIP_COLS} FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? ORDER BY r.created_at`,
   ).bind(agentId).all<MembershipRow>();
   return results;
 }
 
 export async function membership(env: Env, agentId: string, roomId: string): Promise<MembershipRow> {
   const row = await env.DB.prepare(
-    `SELECT m.room_id, r.name, r.kind, m.role, m.last_read_seq
-     FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? AND m.room_id = ?`,
+    `SELECT ${MEMBERSHIP_COLS} FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? AND m.room_id = ?`,
   ).bind(agentId, roomId).first<MembershipRow>();
   // Same answer for "no such room" and "not a member", so room ids can't be probed.
   if (!row) throw new HttpError(404, "room_not_found");
   return row;
 }
 
-interface MemberRow { agent_id: string; owner_id: string; role: string }
+export interface MemberRow { agent_id: string; owner_id: string; name: string; role: string; kind: string; human_owner: string | null }
+
+/** Active members of a room, with the room's kind (one D1 query). */
+export async function roomMembers(env: Env, roomId: string): Promise<MemberRow[]> {
+  const { results } = await env.DB.prepare(
+    `SELECT m.agent_id, a.owner_id, a.name, m.role, r.kind, r.human_owner
+     FROM memberships m JOIN agents a ON a.id = m.agent_id JOIN rooms r ON r.id = m.room_id
+     WHERE m.room_id = ? AND a.status = 'active'`,
+  ).bind(roomId).all<MemberRow>();
+  return results;
+}
+
+/** Fan-out targets for a room, minus the sender. Members are kept for @mention lookup. */
+export type RoomFanout = Fanout & { members: MemberRow[] };
+
+function fanoutFor(roomId: string, rows: MemberRow[], senderId: string | null): RoomFanout {
+  const first = rows[0];
+  return {
+    roomId,
+    recipients: rows.filter((r) => r.agent_id !== senderId).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
+    owners: [...new Set(rows.map((r) => r.owner_id))],
+    direct: !!first && isDirect({ kind: first.kind, human_owner: first.human_owner, members: rows.length }),
+    members: rows,
+  };
+}
 
 /**
  * Everyone who should hear about a new message in a room, in one D1 query,
  * plus the sender's own row. Same 404 for "no such room" and "not a member".
  */
-export async function postingMembership(env: Env, sender: Agent, roomId: string): Promise<Fanout> {
-  const { results } = await env.DB.prepare(
-    `SELECT m.agent_id, a.owner_id, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
-     WHERE m.room_id = ? AND a.status = 'active'`,
-  ).bind(roomId).all<MemberRow>();
-  const me = results.find((r) => r.agent_id === sender.id);
+export async function postingMembership(env: Env, sender: Agent, roomId: string): Promise<RoomFanout> {
+  const rows = await roomMembers(env, roomId);
+  const me = rows.find((r) => r.agent_id === sender.id);
   if (!me) throw new HttpError(404, "room_not_found");
   if (me.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
-  return {
-    roomId,
-    recipients: results.filter((r) => r.agent_id !== sender.id).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
-    owners: [...new Set(results.map((r) => r.owner_id))],
-  };
+  return fanoutFor(roomId, rows, sender.id);
+}
+
+/** URL-ish handle for @mentions: lowercase, spaces → "-". "Kernel Bot" → "kernel-bot". */
+export const mentionHandle = (name: string) => name.trim().toLowerCase().replace(/\s+/g, "-");
+
+/**
+ * Server-side metadata: resolve @mentions (from the text and an optional
+ * `mentions` list of names/ids) against the room's members, and check
+ * `reply_to`. Unknown names are ignored; nobody outside the room can be mentioned.
+ */
+export async function prepareMeta(
+  env: Env, fanout: RoomFanout, senderId: string, text: string, b: Record<string, unknown>, meta: MessageMeta,
+): Promise<MessageMeta> {
+  const byHandle = new Map<string, string>();
+  for (const m of fanout.members) {
+    byHandle.set(m.agent_id.toLowerCase(), m.agent_id);
+    byHandle.set(mentionHandle(m.name), m.agent_id);
+  }
+  const wanted = new Set<string>();
+  let everyone = false;
+  for (const match of text.matchAll(/(^|[^\w@])@([A-Za-z0-9][\w.-]{0,63})/g)) {
+    const h = match[2].toLowerCase().replace(/[.-]+$/, "");
+    if (h === "everyone" || h === "here") everyone = true;
+    else wanted.add(h);
+  }
+  if (Array.isArray(b.mentions)) for (const x of b.mentions.slice(0, 50)) if (typeof x === "string") wanted.add(mentionHandle(x));
+  const ids = [...new Set([...wanted].map((h) => byHandle.get(h)).filter((x): x is string => !!x && x !== senderId))];
+  if (ids.length) meta.mentions = ids;
+  if (everyone) meta.everyone = true;
+
+  const replyTo = str(b.reply_to, "reply_to", 100);
+  if (replyTo) {
+    const { roomId, seq } = parseMessageId(replyTo);
+    if (roomId !== fanout.roomId) throw new HttpError(400, "invalid_field", "reply_to must be a message in the same room");
+    const target = await room(env, roomId).getMessage(seq);
+    if (!target || target.kind !== "message") throw new HttpError(404, "reply_target_not_found");
+    meta.reply_to = replyTo;
+    meta.reply_to_sender = target.sender_id;
+  }
+  return meta;
 }
 
 /** Only these metadata keys are kept. Trust fields from clients are dropped. */
@@ -168,15 +233,16 @@ export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: st
  * have at least one active agent in the room. Every agent member is notified,
  * and the thread's turn-cap streak resets.
  */
-export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, text: string, meta: MessageMeta): Promise<Sent> {
+export async function ownerFanout(env: Env, ownerId: string, roomId: string): Promise<RoomFanout> {
+  const rows = await roomMembers(env, roomId);
+  if (!rows.some((r) => r.owner_id === ownerId)) throw new HttpError(404, "room_not_found");
+  return fanoutFor(roomId, rows, null);
+}
+
+export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, text: string, meta: MessageMeta, fanout?: RoomFanout): Promise<Sent> {
   const { env } = ctx;
   checkBodySize(env, text);
-  const { results } = await env.DB.prepare(
-    `SELECT m.agent_id, a.owner_id FROM memberships m JOIN agents a ON a.id = m.agent_id
-     WHERE m.room_id = ? AND a.status = 'active'`,
-  ).bind(roomId).all<{ agent_id: string; owner_id: string }>();
-  if (!results.some((r) => r.owner_id === ownerId)) throw new HttpError(404, "room_not_found");
-  const fanout: Fanout = { roomId, recipients: results, owners: [...new Set(results.map((r) => r.owner_id))] };
+  fanout ??= await ownerFanout(env, ownerId, roomId);
   const res = await room(env, roomId).sendHuman({ sender_id: ownerId, sender_owner_id: ownerId }, text, meta, fanout);
   const id = `${roomId}:${res.seq}`;
   await audit(env, ownerId, "owner.send", id, { thread_id: meta.thread_id ?? null, bytes: text.length });
@@ -185,7 +251,11 @@ export async function sendAsOwner(ctx: Ctx, ownerId: string, roomId: string, tex
 
 // ---------------------------------------------------------------- reading
 
-export function present(viewerOwner: string, roomId: string, m: StoredMessage) {
+/**
+ * Shape a stored message for a viewer. With `viewer` (an agent) it also says
+ * how the message relates to that agent: `attention`.
+ */
+export function present(viewerOwner: string, roomId: string, m: StoredMessage, viewer?: { agentId: string; direct: boolean }) {
   const trust_tier: TrustTier = tierFor(viewerOwner, m.sender_owner_id);
   // Owners post as themselves (github:<user>) from the dashboard; agents as agt_….
   const sender_kind = m.sender_id.startsWith("github:") ? "human" : "agent";
@@ -194,10 +264,11 @@ export function present(viewerOwner: string, roomId: string, m: StoredMessage) {
   if (m.kind === "reaction") {
     return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
   }
-  return { ...base, body: m.body, meta: m.meta, no_turn: false };
+  const attention = viewer && m.sender_id !== viewer.agentId ? attentionFor(viewer.agentId, viewer.direct, m.meta) : undefined;
+  return { ...base, body: m.body, meta: m.meta, no_turn: false, ...(attention ? { attention } : {}) };
 }
 
-export async function readHistory(env: Env, viewerOwner: string, roomId: string, url: URL) {
+export async function readHistory(env: Env, viewerOwner: string, roomId: string, url: URL, viewer?: { agentId: string; direct: boolean }) {
   const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? PAGE_LIMIT) || PAGE_LIMIT, 1), 100);
   const before = url.searchParams.get("before");
   const after = url.searchParams.get("after");
@@ -208,7 +279,7 @@ export async function readHistory(env: Env, viewerOwner: string, roomId: string,
     threadId: thread ?? undefined,
     limit,
   });
-  return { room: roomId, messages: msgs.map((m) => present(viewerOwner, roomId, m)) };
+  return { room: roomId, messages: msgs.map((m) => present(viewerOwner, roomId, m, viewer)) };
 }
 
 // ---------------------------------------------------------------- owners

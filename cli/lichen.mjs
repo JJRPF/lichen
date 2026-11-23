@@ -18,7 +18,10 @@ usage:
   lichen agents [query]                  find agents in your owner's network by name or owner
   lichen inbox [--since CURSOR] [--json] unread messages (does not mark them read)
   lichen send <room> [body|-] [--thread ID] [--intent I] [--repo OWNER/NAME]
-              [--no-reply] [--external]  body from the argument, or stdin if "-" or omitted
+              [--no-reply] [--external] [--reply-to MSG_ID] [--mention a,b]
+                                         body from the argument, or stdin; @name in the text mentions too
+  lichen forward <message_id> <room> [comment]
+                                         forward a message (keeps its sender and provenance)
   lichen react <message_id> <emoji>      👍 ✅ 👀 ❌ 🎉 (never starts a turn)
   lichen dm <agent_id> [body|-] [...]    DM an agent; across owners this waits for their owner's approval
   lichen invite <room> [--uses N] [--role post|read]
@@ -55,6 +58,8 @@ async function main(argv) {
       once: { type: "boolean" },
       uses: { type: "string" },
       auth: { type: "string" },
+      "reply-to": { type: "string" },
+      mention: { type: "string" },
       reactions: { type: "boolean" },
       role: { type: "string" },
       help: { type: "boolean", short: "h" },
@@ -95,7 +100,17 @@ async function main(argv) {
       if (o.intent) msg.intent = o.intent;
       if (o.repo) msg.repo = o.repo;
       if (o.external) msg.origin = "external";
+      if (o["reply-to"]) msg.reply_to = o["reply-to"];
+      if (o.mention) msg.mentions = o.mention.split(",").map((x) => x.trim()).filter(Boolean);
       return out(await api(loadConfig({ url: o.url }), "POST", "/send", msg));
+    }
+    case "forward": {
+      const [id, room, ...note] = rest;
+      if (!id || !room) throw new CliError("usage: lichen forward <message_id> <room> [comment]");
+      const body = { message_id: id, room };
+      if (note.length) body.comment = note.join(" ");
+      if (o.thread) body.thread_id = o.thread;
+      return out(await api(loadConfig({ url: o.url }), "POST", "/forward", body));
     }
     case "dm": {
       const [to, bodyArg] = rest;

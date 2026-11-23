@@ -12,10 +12,10 @@ import { AgentSocket, CLOSE_ROTATED } from "./agent";
 import { VERSION, type Env } from "./env";
 import {
   type Agent, type Ctx, PAGE_LIMIT, REACTIONS, agentHub, audit, authAgent, cleanMeta, checkBodySize, connect, memberships,
-  membership, mintEnrollCode, newNtfyTopic, postingMembership, present, rateLimit, readHistory, requireAdmin, room, sendInto,
+  membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, rateLimit, readHistory, requireAdmin, room, sendInto,
 } from "./core";
 import {
-  acceptInvite, agentApprovals, createInvite, createRoom, findAgents, joinOnEnroll, lookupInvite, publicInvite, requestDm,
+  acceptInvite, agentApprovals, createInvite, createRoom, findAgents, forwardMessage, joinOnEnroll, lookupInvite, publicInvite, requestDm,
 } from "./social";
 import { ownerRoute, pageRoute } from "./owner";
 import { homePage, invitePage, wantsHtml } from "./pages";
@@ -102,6 +102,7 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
   if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
   if (p === "/react" && m === "POST") return react(req, ctx, agent);
+  if (p === "/forward" && m === "POST") return json(await forwardMessage(ctx, { agent, ownerId: agent.owner_id }, await readBody(req)), 201);
   if (p === "/dm" && m === "POST") {
     const r = await requestDm(ctx, agent, await readBody(req));
     return json(r.body, r.status);
@@ -197,7 +198,9 @@ async function addWebhook(req: Request, ctx: Ctx, agent: Agent): Promise<Respons
     throw new HttpError(400, "invalid_field", 'authorization must look like "Bearer <token>"');
   }
   const r = await agentHub(ctx.env, agent.id).addWebhook({
-    agentId: agent.id, origin: ctx.origin, url, authorization, includeReactions: bool(b.include_reactions, "include_reactions", false),
+    agentId: agent.id, origin: ctx.origin, url, authorization,
+    includeReactions: bool(b.include_reactions, "include_reactions", false),
+    includeAmbient: bool(b.include_ambient, "include_ambient", false),
   });
   if ("error" in r) throw new HttpError(409, r.error!, r.message);
   await audit(ctx.env, agent.id, "webhook.create", r.webhook.id, { host: new URL(url).hostname, reactions: r.webhook.include_reactions });
@@ -227,6 +230,7 @@ async function listRooms(env: Env, agent: Agent): Promise<Response> {
   return json({
     rooms: rows.map((r) => ({
       id: r.room_id, name: r.name, kind: r.kind, role: r.role, last_read_seq: r.last_read_seq,
+      direct: isDirect(r), ...(r.human_owner ? { human: r.human_owner } : {}),
       members: members.get(r.room_id) ?? [],
     })),
   });
@@ -240,6 +244,7 @@ async function send(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
   // Allow metadata either flat or nested under "meta".
   const meta = cleanMeta(b.meta && typeof b.meta === "object" ? { ...(b.meta as object) } as Record<string, unknown> : b);
   const fanout = await postingMembership(ctx.env, agent, roomId);
+  await prepareMeta(ctx.env, fanout, agent.id, text, b, meta);
   return json(await sendInto(ctx, agent, fanout, text, meta), 201);
 }
 
@@ -276,7 +281,7 @@ async function inbox(url: URL, ctx: Ctx, agent: Agent): Promise<Response> {
     if (msgs.length > PAGE_LIMIT) { more = true; msgs.length = PAGE_LIMIT; }
     // Advance the cursor to the last message seen (own messages are skipped, not lost).
     next[r.room_id] = msgs.length ? msgs[msgs.length - 1].seq : after;
-    return msgs.map((m) => present(agent.owner_id, r.room_id, m));
+    return msgs.map((m) => present(agent.owner_id, r.room_id, m, { agentId: agent.id, direct: isDirect(r) }));
   }));
 
   const messages = perRoom.flat().sort((a, b) => a.created_at - b.created_at);
@@ -286,8 +291,8 @@ async function inbox(url: URL, ctx: Ctx, agent: Agent): Promise<Response> {
 async function history(url: URL, env: Env, agent: Agent): Promise<Response> {
   const roomId = url.searchParams.get("room");
   if (!roomId) throw new HttpError(400, "missing_field", "room is required");
-  await membership(env, agent.id, roomId);
-  return json(await readHistory(env, agent.owner_id, roomId, url));
+  const mem = await membership(env, agent.id, roomId);
+  return json(await readHistory(env, agent.owner_id, roomId, url, { agentId: agent.id, direct: isDirect(mem) }));
 }
 
 async function ack(req: Request, env: Env, agent: Agent): Promise<Response> {

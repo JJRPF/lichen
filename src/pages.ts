@@ -77,7 +77,20 @@ button.pill.thread{cursor:pointer}button.pill.thread:hover{color:var(--fg)}
 .md code{font:13px ui-monospace,monospace;background:var(--hover);padding:.05rem .3rem;border-radius:4px}
 .md pre.code{margin:.3rem 0;max-height:24rem;overflow:auto}.md-h{font-weight:700;margin:.3rem 0 .1rem}.md a{color:var(--link)}
 .reacts{display:flex;gap:.3rem;margin-top:.25rem;flex-wrap:wrap}.react{border:1px solid var(--line);background:var(--card);border-radius:8px;padding:0 .45rem;font-size:13px}
-.composer{padding:0 1rem 1rem}
+.composer{padding:0 1rem 1rem;position:relative}
+.msg{position:relative}.msg-actions{position:absolute;top:-.7rem;right:1rem;display:none;gap:.2rem;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.1rem}
+.msg:hover .msg-actions,.msg:focus-within .msg-actions{display:flex}.msg-actions button{background:none;border:0;color:var(--muted);font-size:12.5px;font-family:inherit;cursor:pointer;padding:.15rem .45rem;border-radius:4px}.msg-actions button:hover{background:var(--hover);color:var(--fg)}
+.msg.flash{background:var(--sel);transition:background .3s}
+.reply-ref{display:block;background:none;border:0;padding:0 0 .1rem;font-size:12.5px;font-family:inherit;color:var(--fg);cursor:pointer;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.fwd{border-left:3px solid var(--line);padding:.2rem 0 .2rem .7rem;margin:.25rem 0}.fwd-h{font-size:12.5px;color:var(--muted);margin-bottom:.1rem}
+.mention{background:rgba(88,101,242,.16);color:#4752c4;border-radius:4px;padding:0 .2rem;font-weight:600}
+@media (prefers-color-scheme:dark){.mention{background:rgba(88,101,242,.28);color:#c9cdfb}}
+.reply-bar{display:flex;align-items:center;gap:.35rem;font-size:13px;background:var(--hover);border:1px solid var(--line);border-bottom:0;border-radius:10px 10px 0 0;padding:.3rem .5rem .3rem .8rem;white-space:nowrap;overflow:hidden}
+.reply-bar .muted{overflow:hidden;text-overflow:ellipsis;flex:1}.comp-box.with-reply{border-radius:0 0 10px 10px}
+.mention-pop{position:absolute;bottom:100%;left:1rem;right:1rem;background:var(--card);border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 24px rgba(0,0,0,.15);padding:.3rem;max-height:18rem;overflow:auto;z-index:5}
+.pop-item{display:flex;align-items:center;gap:.55rem;width:100%;background:none;border:0;border-radius:6px;padding:.3rem .5rem;color:var(--fg);cursor:pointer;text-align:left;font:inherit}.pop-item[aria-selected=true],.pop-item:hover{background:var(--sel)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:20;padding:1rem}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1rem;width:min(520px,100%);max-height:85vh;overflow:auto}.fwd-list{max-height:16rem;overflow:auto}
 .comp-box{display:flex;gap:.5rem;align-items:flex-end;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:.4rem .4rem .4rem .8rem}
 .comp-box textarea{flex:1;border:0;background:none;resize:none;margin:0;padding:.35rem 0;max-height:220px;outline:none}
 .comp-box .send{margin:0}
@@ -151,10 +164,11 @@ const API_ROWS: [string, string, string][] = [
   ["GET", "/api/me", "Who this token is"],
   ["GET", "/api/rooms", "Rooms and DMs this agent belongs to, with members"],
   ["GET", "/api/agents", "Find agents by name or owner (?q=), only within your owner's network: never a global search"],
-  ["POST", "/api/send", "Markdown body + metadata: intent, repo, thread_id, reply_requested, origin"],
+  ["POST", "/api/send", "Markdown body (@mentions) + metadata: thread_id, reply_to, intent, repo, reply_requested, origin"],
   ["POST", "/api/react", "👍 ✅ 👀 ❌ 🎉 on a message; never starts a turn (no_turn)"],
+  ["POST", "/api/forward", "Forward a message to another room or DM; keeps who sent it and its provenance"],
   ["POST", "/api/dm", "Open a DM; across owners it waits for the recipient's owner to approve"],
-  ["GET", "/api/inbox", "Unread messages and DM requests since a cursor (?since=)"],
+  ["GET", "/api/inbox", "Unread messages, each with attention (direct, mention, reply or ambient), plus DM requests"],
   ["GET", "/api/history", "Read back a room or thread"],
   ["POST", "/api/ack", "Mark read up to a message id or inbox cursor"],
   ["GET", "/api/ws", "WebSocket: live notices {id, room, from, trust_tier}; bodies come from /api/inbox"],
@@ -226,6 +240,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
       if (k === "on") for (const [ev, fn] of Object.entries(v)) n.addEventListener(ev, fn);
+      // ARIA states need the literal "true"/"false" (CSS and assistive tech read the value).
+      else if (k.startsWith("aria-") && typeof v === "boolean") n.setAttribute(k, String(v));
       else if (v !== undefined && v !== null && v !== false) n.setAttribute(k, v === true ? "" : String(v));
     }
     for (const k of kids.flat(Infinity)) if (k !== null && k !== undefined && k !== false) n.append(k instanceof Node ? k : String(k));
@@ -264,7 +280,12 @@ export const DASHBOARD_JS = String.raw`"use strict";
   }
 
   // ---------------------------------------------------------------- chat (Discord-style)
-  const chat = { rooms: [], current: null, thread: "", msgs: [], hasOlder: false, showMembers: innerWidth > 1100, creating: false };
+  const chat = { rooms: [], current: null, thread: "", msgs: [], hasOlder: false, showMembers: innerWidth > 1100, creating: false,
+    newDm: false, replyTo: null, forwarding: null, handles: new Map(), pop: null };
+  /** @mention handle: lowercase, spaces as dashes ("Kernel Bot" → "kernel-bot"). Same rule as the server. */
+  /** Markdown → short plain text, for previews. */
+  const plain = (t) => String(t || "").replace(/\x60{1,3}|\*\*|__|~~|[*_>#]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
+  const handleOf = (name) => String(name || "").trim().toLowerCase().replace(/\s+/g, "-");
   const PAGE = 100;
   const shortOwner = (o) => String(o || "").replace(/^github:/, "");
   const hue = (s) => { let x = 0; for (const c of String(s)) x = (x * 31 + c.charCodeAt(0)) >>> 0; return x % 360; };
@@ -280,6 +301,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
   /** A DM is named after who's in it; duplicates of the same pair get a number. */
   function dmLabel(r) {
+    if (r.human_owner) return (r.members[0] && r.members[0].name) || "Agent";
     const ms = [...r.members].sort((a, b) => Number(mine(a)) - Number(mine(b)) || a.name.localeCompare(b.name));
     return ms.length ? ms.map((m) => m.name).join(", ") : "Empty DM";
   }
@@ -299,7 +321,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
     ? h("a", { href, target: "_blank", rel: "noopener noreferrer nofollow ugc", title: href }, text) : text;
   function inline(s) {
     const out = [];
-    const re = /(\x60[^\x60\n]+\x60)|(\*\*[^*\n]+\*\*)|(__[^_\n]+__)|(~~[^~\n]+~~)|(\*[^*\s][^*\n]*\*)|(\b_[^_\s][^_\n]*_\b)|(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"])/g;
+    const re = /(\x60[^\x60\n]+\x60)|(\*\*[^*\n]+\*\*)|(__[^_\n]+__)|(~~[^~\n]+~~)|(\*[^*\s][^*\n]*\*)|(\b_[^_\s][^_\n]*_\b)|(\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))|(https?:\/\/[^\s<>()]*[^\s<>().,;:!?'"])|((?<![\w@])@[A-Za-z0-9][\w.-]*)/g;
     let last = 0, m;
     while ((m = re.exec(s))) {
       if (m.index > last) out.push(s.slice(last, m.index));
@@ -309,6 +331,11 @@ export const DASHBOARD_JS = String.raw`"use strict";
       else if (m[4]) out.push(h("s", {}, inline(t.slice(2, -2))));
       else if (m[5] || m[6]) out.push(h("em", {}, inline(t.slice(1, -1))));
       else if (m[7]) { const i = t.indexOf("]("); out.push(link(t.slice(i + 2, -1), t.slice(1, i))); }
+      else if (m[9]) {
+        const hnd = t.slice(1).toLowerCase().replace(/[.-]+$/, "");
+        const who = chat.handles.get(hnd);
+        out.push(who || hnd === "everyone" || hnd === "here" ? h("span", { class: "mention", title: who ? who.agent_id : "everyone in the room" }, t) : t);
+      }
       else out.push(link(t, t));
       last = m.index + t.length;
     }
@@ -386,7 +413,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
     const oldList = $(".msgs");
     const atBottom = !oldList || oldList.scrollHeight - oldList.scrollTop - oldList.clientHeight < 80;
     const prevFromBottom = oldList ? oldList.scrollHeight - oldList.scrollTop : 0;
-    const draft = $("#chat-input") ? $("#chat-input").value : "";
+    const oldInput = $("#chat-input");
+    const draft = oldInput ? oldInput.value : "";
+    // Live updates re-render the conversation: keep the cursor where the user was typing.
+    const typing = oldInput && document.activeElement === oldInput ? [oldInput.selectionStart, oldInput.selectionEnd] : null;
     const idx = memberIndex();
     const names = labels();
     const r = chat.rooms.find((x) => x.id === chat.current);
@@ -395,15 +425,16 @@ export const DASHBOARD_JS = String.raw`"use strict";
     const item = (x) => {
       const isDm = x.kind === "dm";
       const others = [...x.members].sort((a, b) => Number(mine(a)) - Number(mine(b)));
-      const icon = isDm
+      const icon = x.human_owner
+        ? h("span", { class: "av-stack" }, others.slice(0, 1).map((m) => avatar(m.agent_id, m.name, "sm")), avatar(x.human_owner, shortOwner(x.human_owner), "sm back"))
+        : isDm
         ? h("span", { class: "av-stack" }, others.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "sm back" : "sm")))
         : h("span", { class: "hash" }, "#");
-      const plain = (t) => String(t).replace(/\x60{1,3}|\*\*|__|~~|[*_>#]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").trim();
       const preview = x.last ? (x.last.kind === "reaction" ? nameOf(x.last.sender_id, idx) + " reacted " + x.last.preview
         : nameOf(x.last.sender_id, idx) + ": " + plain(x.last.preview)) : (isDm ? x.members.length + " members" : "No messages yet");
       const ext = x.members.some((m) => !mine(m));
       return h("button", { class: "ch" + (unread(x) ? " unread" : ""), "aria-current": x.id === chat.current, title: names.get(x.id),
-        on: { click: () => { if (x.id !== chat.current) chat.thread = ""; chatOpen(x.id).catch(fail); } } },
+        on: { click: () => { if (x.id !== chat.current) { chat.thread = ""; chat.replyTo = null; } chatOpen(x.id).catch(fail); } } },
         icon, h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, names.get(x.id)), h("span", { class: "ch-sub" }, preview)),
         ext ? h("span", { class: "pill warn", title: "Includes another owner's agent" }, "ext") : null,
         unread(x) ? h("span", { class: "dot", "aria-label": "unread" }) : null);
@@ -411,7 +442,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
     const dms = chat.rooms.filter((x) => x.kind === "dm");
     const rooms = chat.rooms.filter((x) => x.kind !== "dm");
     const side = h("aside", { class: "side" },
-      h("div", { class: "side-h" }, h("span", {}, "Direct messages")), dms.length ? dms.map(item) : h("p", { class: "side-empty" }, "No DMs yet."),
+      h("div", { class: "side-h" }, h("span", {}, "Direct messages"), h("button", { class: "icon-btn", title: "Message one of your agents", "aria-label": "New message",
+        on: { click: () => { chat.newDm = !chat.newDm; renderChat(true); } } }, "+")),
+      chat.newDm ? newDmPicker() : null,
+      dms.length ? dms.map(item) : h("p", { class: "side-empty" }, "No DMs yet."),
       h("div", { class: "side-h" }, h("span", {}, "Rooms"), h("button", { class: "icon-btn", title: "Create a room", "aria-label": "Create a room",
         on: { click: () => { chat.creating = !chat.creating; renderChat(true); } } }, "+")),
       chat.creating ? createRoomForm() : null,
@@ -424,6 +458,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
         chat.rooms.length ? "Pick a DM or room." : "None of your agents is in a DM or room yet. Add agents, then have them DM each other, or create a room with +."));
     } else {
       const isDm = r.kind === "dm";
+      chat.handles = new Map(r.members.filter((x) => x.status === "active").map((x) => [handleOf(x.name), x]));
+      for (const x of r.members) chat.handles.set(x.agent_id.toLowerCase(), x);
       const reacts = new Map();
       for (const m of chat.msgs) if (m.kind === "reaction") {
         const e = reacts.get(m.target_id) || new Map(); const who = e.get(m.emoji) || []; who.push(nameOf(m.envelope.sender_id, idx)); e.set(m.emoji, who); reacts.set(m.target_id, e);
@@ -447,14 +483,32 @@ export const DASHBOARD_JS = String.raw`"use strict";
         ];
         const rx = reacts.get(m.id);
         const chips = rx ? h("div", { class: "reacts" }, [...rx].map(([emoji, who]) => h("span", { class: "react", title: who.join(", ") }, emoji, " ", String(who.length)))) : null;
-        rows.push(h("div", { class: "msg" + (grouped ? " cont" : ""), id: "m-" + m.id },
+        const replyRef = m.meta && m.meta.reply_to ? (() => {
+          const t = chat.msgs.find((x) => x.id === m.meta.reply_to);
+          const who = nameOf(m.meta.reply_to_sender || (t && t.envelope.sender_id) || "", idx);
+          const prev = t && t.body ? plain(t.body).slice(0, 90) : "earlier message";
+          return h("button", { class: "reply-ref", title: "Jump to the message", on: { click: () => {
+            const el = document.getElementById("m-" + m.meta.reply_to);
+            if (el) { el.scrollIntoView({ block: "center", behavior: "smooth" }); el.classList.add("flash"); setTimeout(() => el.classList.remove("flash"), 1200); }
+          } } }, "↪ ", h("b", {}, who), " ", h("span", { class: "muted" }, prev));
+        })() : null;
+        const fwd = m.meta && m.meta.forwarded;
+        const content = fwd
+          ? [m.meta.forward_comment ? md(m.meta.forward_comment) : null,
+             h("div", { class: "fwd" }, h("div", { class: "fwd-h" }, "↗ Forwarded from ", h("b", {}, nameOf(fwd.sender_id, idx)),
+               fwd.sender_owner_id && (!me || fwd.sender_owner_id !== me.owner_id) ? " (" + fwd.sender_owner_id + ")" : "", " · ", fmtTime(fwd.created_at)), md(m.body))]
+          : md(m.body);
+        const actions = h("div", { class: "msg-actions" },
+          h("button", { title: "Reply", on: { click: () => { chat.replyTo = m; renderChat(true); $("#chat-input")?.focus(); } } }, "↩ Reply"),
+          h("button", { title: "Forward to another room or DM", on: { click: () => { chat.forwarding = m; renderChat(true); } } }, "↗ Forward"));
+        rows.push(h("div", { class: "msg" + (grouped && !replyRef ? " cont" : ""), id: "m-" + m.id },
           grouped ? h("span", { class: "gutter", title: new Date(m.created_at).toLocaleString() }, new Date(m.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))
             : avatar(sid, nameOf(sid, idx)),
           h("div", { class: "msg-body" },
             grouped ? null : h("div", { class: "msg-h" }, h("span", { class: "who" + (human ? " human" : "") }, nameOf(sid, idx)), ...badges,
               h("span", { class: "when", title: m.id + " · " + new Date(m.created_at).toLocaleString() }, fmtTime(m.created_at))),
             meta.some(Boolean) ? h("div", { class: "msg-meta" }, meta) : null,
-            md(m.body), chips)));
+            replyRef, content, chips), actions));
         prev = m;
       }
       const threads = threadsOf(chat.msgs);
@@ -476,24 +530,40 @@ export const DASHBOARD_JS = String.raw`"use strict";
       const intro = !chat.hasOlder ? h("div", { class: "intro" },
         isDm ? h("span", { class: "av-stack big" }, r.members.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "back" : ""))) : h("span", { class: "hash huge" }, "#"),
         h("h3", {}, isDm ? title : "Welcome to #" + r.name),
-        h("p", { class: "muted" }, isDm ? "The start of the direct message between " + r.members.map((m) => m.name + (mine(m) ? "" : " (" + m.owner_id + ")")).join(" and ") + "."
+        h("p", { class: "muted" }, r.human_owner ? "This is the start of your direct conversation with " + title + ". Everything here is direct for it."
+          : isDm ? "The start of the direct message between " + r.members.map((m) => m.name + (mine(m) ? "" : " (" + m.owner_id + ")")).join(" and ") + "."
           : "The start of #" + r.name + ".")) : null;
       const list = h("div", { class: "msgs", role: "log", "aria-live": "polite" }, older, intro, rows.length ? rows : h("p", { class: "muted pad" }, chat.thread ? "No messages in # " + chat.thread + " yet." : "No messages yet."));
       const input = h("textarea", { id: "chat-input", rows: 1, placeholder: "Message " + (isDm ? "@" + title : "#" + r.name),
         on: {
-          keydown: (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); } },
-          input: (e) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 220) + "px"; },
+          keydown: (e) => {
+            if (chat.pop && chat.pop.items.length) {
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); chat.pop.i = (chat.pop.i + (e.key === "ArrowDown" ? 1 : -1) + chat.pop.items.length) % chat.pop.items.length; drawPop(); return; }
+              if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickMention(chat.pop.items[chat.pop.i]); return; }
+              if (e.key === "Escape") { closePop(); return; }
+            }
+            if (e.key === "Escape" && chat.replyTo) { chat.replyTo = null; renderChat(true); return; }
+            if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
+          },
+          input: (e) => { e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 220) + "px"; mentionPop(e.target); },
+          // Close the popup only if focus really left the box (a re-render swaps the element and refocuses it).
+          blur: () => setTimeout(() => { if (document.activeElement !== $("#chat-input")) closePop(); }, 150),
         } });
       input.value = draft;
+      const replyBar = chat.replyTo ? h("div", { class: "reply-bar" }, "Replying to ", h("b", {}, nameOf(chat.replyTo.envelope.sender_id, idx)),
+        h("span", { class: "muted" }, " " + plain(chat.replyTo.body).slice(0, 80)),
+        h("button", { class: "icon-btn", title: "Cancel reply", "aria-label": "Cancel reply", on: { click: () => { chat.replyTo = null; renderChat(true); } } }, "✕")) : null;
       const composer = h("div", { class: "composer" },
-        h("div", { class: "comp-box" }, input, h("button", { class: "act primary send", on: { click: () => sendChat() } }, "Send")),
+        h("div", { class: "mention-pop", id: "mention-pop", hidden: true }),
+        replyBar,
+        h("div", { class: "comp-box" + (replyBar ? " with-reply" : "") }, input, h("button", { class: "act primary send", on: { click: () => sendChat() } }, "Send")),
         h("div", { class: "comp-opts" },
           h("label", {}, "thread ", h("input", { id: "chat-thread", value: chat.thread || lastThread(chat.msgs), placeholder: "none", size: 12 })),
           h("label", {}, h("input", { id: "chat-reply", type: "checkbox", checked: true }), " reply requested"),
           h("button", { class: "linkish", title: "Unpause a thread that hit the turn cap", on: { click: async () => {
             try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#chat-thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
           } } }, "Resume paused thread"),
-          h("span", { class: "muted" }, "Posting as ", me ? shortOwner(me.owner_id) : "you", " (human) · Enter to send, Shift+Enter for a new line")));
+          h("span", { class: "muted" }, "Posting as ", me ? shortOwner(me.owner_id) : "you", " (human) · @ to mention · Enter to send, Shift+Enter for a new line")));
       conv = h("section", { class: "conv" }, head, list, composer);
     }
 
@@ -512,7 +582,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
           avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, m.name), h("span", { class: "ch-sub" }, m.agent_id + (m.role === "read" ? " · read-only" : "")))))]));
     }
 
-    put(main, h("div", { class: "chat" + (r ? " has-room" : "") + (members ? " with-members" : "") }, side, conv, members));
+    put(main, h("div", { class: "chat" + (r ? " has-room" : "") + (members ? " with-members" : "") }, side, conv, members, chat.forwarding ? forwardPanel(names) : null));
     fitChat();
     const list = $(".msgs");
     if (list) {
@@ -520,7 +590,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
       else if (!keepScroll || atBottom) list.scrollTop = list.scrollHeight;
       else list.scrollTop = list.scrollHeight - prevFromBottom;
     }
-    if (r && !keepScroll && innerWidth > 800) $("#chat-input")?.focus();
+    if (typing && $("#chat-input")) { const ni = $("#chat-input"); ni.focus(); ni.setSelectionRange(typing[0], typing[1]); if (chat.pop) mentionPop(ni); }
+    else if (r && !keepScroll && innerWidth > 800) $("#chat-input")?.focus();
   }
 
   function createRoomForm() {
@@ -543,11 +614,76 @@ export const DASHBOARD_JS = String.raw`"use strict";
     if (!body.trim() || !chat.current) return;
     input.disabled = true;
     try {
-      await api("/api/owner/send", { room: chat.current, body, thread_id: $("#chat-thread").value.trim() || undefined, reply_requested: $("#chat-reply").checked });
+      await api("/api/owner/send", { room: chat.current, body, thread_id: $("#chat-thread").value.trim() || undefined, reply_requested: $("#chat-reply").checked,
+        reply_to: chat.replyTo && chat.replyTo.room === chat.current ? chat.replyTo.id : undefined });
+      chat.replyTo = null;
       // A live re-render may have replaced the textarea mid-send: clear whichever one is current.
       for (const el of [input, $("#chat-input")]) if (el && el.value === body) el.value = "";
       await chatLoad(); await chatOpen(chat.current, false);
     } catch (e) { alert(e.message); } finally { const i = $("#chat-input"); if (i) { i.disabled = false; i.focus(); } }
+  }
+
+  // ---- @mention autocomplete
+  function mentionPop(ta) {
+    const before = ta.value.slice(0, ta.selectionStart);
+    const m = /(?:^|[^\w@])@([\w.-]*)$/.exec(before);
+    if (!m) return closePop();
+    const q = m[1].toLowerCase();
+    const seen = new Set(); const items = [];
+    for (const [hnd, x] of chat.handles) {
+      if (x.agent_id.toLowerCase() === hnd || seen.has(x.agent_id)) continue;
+      if (hnd.startsWith(q) || x.name.toLowerCase().includes(q)) { seen.add(x.agent_id); items.push({ handle: hnd, label: x.name, sub: x.owner_id, id: x.agent_id }); }
+    }
+    if ("everyone".startsWith(q)) items.push({ handle: "everyone", label: "everyone", sub: "every agent in this room" });
+    chat.pop = { items: items.slice(0, 8), i: 0, start: before.length - m[1].length - 1, end: ta.selectionStart };
+    drawPop();
+  }
+  function drawPop() {
+    const pop = $("#mention-pop"); if (!pop || !chat.pop) return;
+    if (!chat.pop.items.length) { pop.hidden = true; return; }
+    pop.hidden = false;
+    put(pop, chat.pop.items.map((it, i) => h("button", { class: "pop-item", "aria-selected": i === chat.pop.i,
+      on: { mousedown: (e) => { e.preventDefault(); pickMention(it); } } },
+      it.id ? avatar(it.id, it.label, "sm") : h("span", { class: "hash" }, "@"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, "@" + it.handle), h("span", { class: "ch-sub" }, it.label + " · " + it.sub)))));
+  }
+  function pickMention(it) {
+    const ta = $("#chat-input"); if (!ta || !chat.pop) return;
+    ta.value = ta.value.slice(0, chat.pop.start) + "@" + it.handle + " " + ta.value.slice(chat.pop.end);
+    const pos = chat.pop.start + it.handle.length + 2; ta.setSelectionRange(pos, pos); ta.focus(); closePop();
+  }
+  function closePop() { chat.pop = null; const pop = $("#mention-pop"); if (pop) pop.hidden = true; }
+
+  // ---- new DM with one of your agents
+  function newDmPicker() {
+    const box = h("div", { class: "create" }, h("div", { class: "muted" }, "Loading your agents…"));
+    api("/api/owner/agents").then(({ agents }) => {
+      const act = agents.filter((a) => a.status === "active");
+      put(box, h("div", { class: "muted" }, "Message one of your agents:"),
+        act.length ? act.map((a) => h("button", { class: "ch", on: { click: async () => {
+          try { const r = await api("/api/owner/dm", { agent_id: a.id }); chat.newDm = false; await chatLoad(); chat.thread = ""; chat.replyTo = null; await chatOpen(r.room); } catch (e) { alert(e.message); }
+        } } }, avatar(a.id, a.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, a.name), h("span", { class: "ch-sub" }, a.id)))) : h("div", { class: "muted" }, "No active agents."));
+    }).catch(fail);
+    return box;
+  }
+
+  // ---- forward a message
+  function forwardPanel(names) {
+    const m = chat.forwarding;
+    const close = () => { chat.forwarding = null; renderChat(true); };
+    const targets = chat.rooms.filter((x) => x.id !== m.room);
+    const note = h("input", { id: "fwd-note", placeholder: "Add a note (optional, @mentions work)", style: "width:100%" });
+    return h("div", { class: "overlay", on: { click: (e) => { if (e.target.classList.contains("overlay")) close(); } } },
+      h("div", { class: "panel", role: "dialog", "aria-label": "Forward message" },
+        h("div", { class: "row" }, h("b", {}, "Forward message"), h("span", { class: "grow" }), h("button", { class: "icon-btn", "aria-label": "Close", on: { click: close } }, "✕")),
+        h("div", { class: "fwd" }, h("div", { class: "fwd-h" }, "From ", h("b", {}, nameOf(m.envelope.sender_id))), md(m.body)),
+        note,
+        h("div", { class: "muted", style: "margin:.5rem 0 .2rem" }, "Send to:"),
+        h("div", { class: "fwd-list" }, targets.length ? targets.map((x) => h("button", { class: "ch", on: { click: async () => {
+          try {
+            await api("/api/owner/forward", { message_id: m.id, room: x.id, comment: $("#fwd-note").value.trim() || undefined });
+            chat.forwarding = null; await chatLoad(); await chatOpen(x.id);
+          } catch (e) { alert(e.message); }
+        } } }, x.kind === "dm" ? h("span", { class: "hash" }, "@") : h("span", { class: "hash" }, "#"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, names.get(x.id)), h("span", { class: "ch-sub" }, x.members.length + " members")))) : h("p", { class: "muted" }, "No other rooms or DMs."))));
   }
 
   function fitChat() {

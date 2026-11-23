@@ -54,6 +54,7 @@ before(async () => {
       if (url.pathname === "/dm") return send(202, { status: "pending", approval_id: "apr_x", approval_url: "https://lichen.test/approvals#apr_x" });
       if (url.pathname === "/webhooks") return send(req.method === "POST" ? 201 : 200, { ok: true });
       if (url.pathname.startsWith("/webhooks/")) return send(200, { ok: true });
+      if (url.pathname === "/forward") return send(201, { id: "r_b:2" });
       if (url.pathname === "/agents") return send(200, { agents: [], q: url.searchParams.get("q") });
       if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
       if (url.pathname.startsWith("/i/")) return send(200, { status: "joined", room: "r_a", agent_id: "agt_me" });
@@ -410,5 +411,44 @@ describe("webhooks", () => {
     assert.deepEqual(requests.map((r) => `${r.method} ${r.path}`), ["POST /webhooks", "GET /webhooks", "POST /webhooks/whk_abc/test", "DELETE /webhooks/whk_abc"]);
     assert.deepEqual(requests[0].body, { url: "https://hooks.example/lichen", include_reactions: true, authorization: "Bearer abc" });
     assert.equal((await run(["webhook", "add"])).code, 1);
+  });
+});
+
+describe("attention", () => {
+  const amb = (seq, attention, extra = {}) => msg("r_a", seq, { attention, ...extra });
+  test("ambient messages never start a turn; mentions, replies and DMs do", async () => {
+    inboxReply = { messages: [amb(1, "ambient")], cursor: encodeCursor({ r_a: 1 }), more: false };
+    assert.equal((await run(["hook", "stop"], { stdin: JSON.stringify({ session_id: "att" }) })).stdout, "");
+    for (const kind of ["mention", "reply", "direct"]) {
+      inboxReply = { messages: [amb(2, "ambient"), amb(3, kind)], cursor: encodeCursor({ r_a: 3 }), more: false };
+      const out = JSON.parse((await run(["hook", "stop"], { stdin: JSON.stringify({ session_id: "att-" + kind }) })).stdout);
+      assert.equal(out.decision, "block", kind);
+      assert.match(out.reason, new RegExp("attention: `" + kind + "`"));
+      assert.match(out.reason, /attention: `ambient` \(no reply expected\)/);
+    }
+  });
+
+  test("renders replies, mentions and forwards", () => {
+    const { text } = renderInbox({ messages: [msg("r_a", 4, {
+      attention: "mention",
+      meta: { reply_requested: false, reply_to: "r_a:1", mentions: ["agt_me"], origin: "external", forward_comment: "FYI",
+        forwarded: { id: "r_b:9", sender_id: "agt_x", sender_owner_id: "github:other", sender_kind: "agent", created_at: 1 } },
+    })], cursor: "" });
+    assert.match(text, /reply to `r_a:1`/);
+    assert.match(text, /mentions: `agt_me`/);
+    assert.match(text, /forwarded from `agt_x` \(owner `github:other`\), original `r_b:9`/);
+    assert.match(text, /forwarder's note: ```text\nFYI\n```/);
+  });
+
+  test("send --reply-to/--mention and forward map to the API", async () => {
+    await run(["send", "r_a", "hi @bob", "--reply-to", "r_a:1", "--mention", "alice, agt_x"]);
+    await run(["forward", "r_a:1", "r_b", "see", "this"]);
+    assert.deepEqual(requests[0].body, { room: "r_a", body: "hi @bob", reply_requested: true, reply_to: "r_a:1", mentions: ["alice", "agt_x"] });
+    assert.deepEqual(requests[1], { ...requests[1], path: "/forward", body: { message_id: "r_a:1", room: "r_b", comment: "see this" } });
+  });
+
+  test("notices keep attention", () => {
+    assert.equal(parseNotice('{"id":"r_a:1","room":"r_a","from":"x","trust_tier":"same_owner","attention":"mention"}').attention, "mention");
+    assert.equal(parseNotice('{"id":"r_a:1","room":"r_a","from":"x","trust_tier":"same_owner","attention":"bogus"}').attention, undefined);
   });
 });

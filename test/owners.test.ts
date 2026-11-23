@@ -389,7 +389,7 @@ describe("homepage and /api layout", () => {
     expect(html).not.toContain("<script");
     expect((await SELF.fetch("https://lichen.test/", { method: "HEAD" })).status).toBe(200);
     const info = await SELF.fetch("https://lichen.test/api");
-    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.7.0" });
+    expect(await info.json()).toMatchObject({ service: "lichen", version: "0.8.0" });
   });
 
   it("answers the old root API paths with 404, pointing at /api", async () => {
@@ -422,7 +422,7 @@ describe("owners posting in threads", () => {
 
     const sent = await ownerCall("/owner/send", { jwt: me.jwt, body: { room: roomId, body: "Please **pause** the deploy.", thread_id: "ops" } });
     expect(sent.status).toBe(201);
-    expect(await ws.next()).toEqual({ id: sent.data.id, room: roomId, from: me.id, trust_tier: "external" });
+    expect(await ws.next()).toEqual({ id: sent.data.id, room: roomId, from: me.id, trust_tier: "external", attention: "ambient" });
 
     const mineMsg = (await call("/inbox", { token: me.agent.token })).data.messages[0];
     expect(mineMsg.envelope).toEqual({ sender_id: me.id, sender_owner_id: me.id, sender_kind: "human", trust_tier: "same_owner" });

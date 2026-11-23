@@ -10,7 +10,7 @@
 // and each member's owner's dashboard socket.
 
 import { DurableObject } from "cloudflare:workers";
-import { ownerHubName, tierFor, type Env, type Notice, type Recipient } from "./env";
+import { attentionFor, ownerHubName, tierFor, type Env, type Notice, type Recipient } from "./env";
 
 export interface Envelope {
   sender_id: string;
@@ -23,6 +23,17 @@ export interface MessageMeta {
   thread_id?: string;
   reply_requested: boolean;
   origin?: "external";
+  // Set by the server only (clients can't send these directly):
+  /** Agent ids mentioned with @name / @agt_… */
+  mentions?: string[];
+  /** @everyone */
+  everyone?: true;
+  /** A reply to this message (same room), and who sent it. */
+  reply_to?: string;
+  reply_to_sender?: string;
+  /** A forwarded copy: who originally sent it, and when. */
+  forwarded?: { id: string; sender_id: string; sender_owner_id: string; sender_kind: "agent" | "human"; created_at: number };
+  forward_comment?: string;
 }
 
 export interface StoredMessage {
@@ -46,6 +57,8 @@ export interface Limits {
 export interface Fanout {
   roomId: string;
   recipients: Recipient[];
+  /** A DM (agent↔agent or human↔agent) or a two-member room: every message there is for you. */
+  direct?: boolean;
   /** Owners of every member, sender's included, for the live dashboard. */
   owners?: string[];
 }
@@ -127,7 +140,7 @@ export class Room extends DurableObject<Env> {
        ON CONFLICT(thread_id, sender_id) DO UPDATE SET last_at = excluded.last_at`,
       thread, env.sender_id, now,
     );
-    this.fanOut(env, seq, false, fanout);
+    this.fanOut(env, seq, false, fanout, meta);
     return { ok: true, seq, created_at: now, paused: pause === 1 };
   }
 
@@ -149,7 +162,7 @@ export class Room extends DurableObject<Env> {
        ON CONFLICT(thread_id) DO UPDATE SET agent_streak = 0, paused = 0`,
       thread,
     );
-    this.fanOut(env, seq, false, fanout);
+    this.fanOut(env, seq, false, fanout, meta);
     return { seq, created_at: now };
   }
 
@@ -173,7 +186,7 @@ export class Room extends DurableObject<Env> {
    * Notify each recipient's AgentSocket DO. Runs after the reply is returned;
    * a failed notice is harmless because /inbox is the source of truth.
    */
-  private fanOut(from: Envelope, seq: number, noTurn: boolean, fanout?: Fanout) {
+  private fanOut(from: Envelope, seq: number, noTurn: boolean, fanout?: Fanout, meta?: MessageMeta) {
     if (!fanout) return;
     const { roomId, recipients, owners = [] } = fanout;
     const toOwners = [...new Set(owners)].map((o) => {
@@ -191,11 +204,16 @@ export class Room extends DurableObject<Env> {
           room: roomId,
           from: from.sender_id,
           trust_tier: tierFor(r.owner_id, from.sender_owner_id),
-          ...(noTurn ? { no_turn: true as const } : {}),
+          ...(noTurn ? { no_turn: true as const } : { attention: attentionFor(r.agent_id, !!fanout.direct, meta ?? null) }),
         };
         return this.env.AGENT.get(this.env.AGENT.idFromName(r.agent_id)).notify(notice);
       })]);
     this.ctx.waitUntil(work);
+  }
+
+  /** One message by seq, or null. */
+  async getMessage(seq: number): Promise<StoredMessage | null> {
+    return (await this.list({ afterSeq: seq - 1, beforeSeq: seq + 1, limit: 1 }))[0] ?? null;
   }
 
   /** Messages with seq > afterSeq, oldest first. */

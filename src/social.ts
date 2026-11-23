@@ -10,10 +10,11 @@
 
 import type { ApprovalEvent, Env } from "./env";
 import {
-  type Agent, type Ctx, type Owner, agentHub, audit, checkBodySize, cleanMeta, membership, ownerCanSeeRoom,
-  ownerNotice, postingMembership, rateLimit, sendInto,
+  type Agent, type Ctx, type Owner, agentHub, audit, checkBodySize, cleanMeta, membership, ownerCanSeeRoom, ownerFanout,
+  ownerNotice, postingMembership, prepareMeta, rateLimit, room, sendAsOwner, sendInto,
 } from "./core";
-import { HttpError, newId, randomString, sha256Hex, str } from "./util";
+import type { MessageMeta } from "./room";
+import { HttpError, bool, newId, parseMessageId, randomString, sha256Hex, str } from "./util";
 import { agentPrompt } from "./guide";
 
 const OWNER_RE = /^github:[a-z0-9-]{1,39}$/;
@@ -431,4 +432,72 @@ export async function findAgents(ctx: Ctx, agent: Agent, q: string) {
   const rank = { same_owner: 0, shared_room: 1, owner_network: 2 } as const;
   agents.sort((x, y) => rank[x.relation as keyof typeof rank] - rank[y.relation as keyof typeof rank] || x.name.localeCompare(y.name));
   return { agents };
+}
+
+// ---------------------------------------------------------------- forwarding
+
+/**
+ * Forward a message into another room or DM. The copy says who originally
+ * sent it, and keeps provenance: anything from another owner, or already
+ * marked origin: external, stays origin: external, even forwarded by your own
+ * agent. Works for agents (must be in the source room and allowed to post in
+ * the target) and owners (must have an agent in both).
+ */
+export async function forwardMessage(ctx: Ctx, by: { agent?: Agent; ownerId: string }, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const messageId = str(b.message_id, "message_id", 100, true)!;
+  const target = str(b.room, "room", 64, true)!;
+  const comment = str(b.comment, "comment", 1000);
+  const { roomId: source, seq } = parseMessageId(messageId);
+
+  if (by.agent) await membership(env, by.agent.id, source);
+  else if (!(await ownerCanSeeRoom(env, by.ownerId, source))) throw new HttpError(404, "room_not_found");
+  const msg = await room(env, source).getMessage(seq);
+  if (!msg || msg.kind !== "message") throw new HttpError(404, "message_not_found");
+
+  const external = msg.sender_owner_id !== by.ownerId || msg.meta?.origin === "external";
+  const meta: MessageMeta = {
+    reply_requested: bool(b.reply_requested, "reply_requested", false),
+    ...(str(b.thread_id, "thread_id", 128) ? { thread_id: str(b.thread_id, "thread_id", 128) } : {}),
+    ...(external ? { origin: "external" as const } : {}),
+    forwarded: {
+      id: messageId, sender_id: msg.sender_id, sender_owner_id: msg.sender_owner_id,
+      sender_kind: msg.sender_id.startsWith("github:") ? "human" : "agent", created_at: msg.created_at,
+    },
+    ...(comment ? { forward_comment: comment } : {}),
+  };
+  const text = msg.body ?? "";
+
+  let sent;
+  if (by.agent) {
+    const fanout = await postingMembership(env, by.agent, target);
+    // Mentions come only from the forwarder's own comment, never the forwarded text.
+    await prepareMeta(env, fanout, by.agent.id, comment ?? "", { mentions: b.mentions }, meta);
+    sent = await sendInto(ctx, by.agent, fanout, text, meta);
+  } else {
+    const fanout = await ownerFanout(env, by.ownerId, target);
+    await prepareMeta(env, fanout, by.ownerId, comment ?? "", { mentions: b.mentions }, meta);
+    sent = await sendAsOwner(ctx, by.ownerId, target, text, meta, fanout);
+  }
+  await audit(env, by.agent?.id ?? by.ownerId, "forward", sent.id, { from: messageId });
+  return { ...sent, forwarded_from: messageId, origin: meta.origin ?? null };
+}
+
+// ---------------------------------------------------------------- human ↔ agent DMs
+
+/** Open (or reuse) a DM between an owner and one of their own agents. */
+export async function humanDm(ctx: Ctx, ownerId: string, agentId: string) {
+  const { env } = ctx;
+  const a = await env.DB.prepare("SELECT id, name FROM agents WHERE id = ? AND owner_id = ? AND status = 'active'")
+    .bind(agentId, ownerId).first<{ id: string; name: string }>();
+  if (!a) throw new HttpError(404, "agent_not_found", "You can DM your own active agents");
+  const existing = await env.DB.prepare(
+    `SELECT r.id FROM rooms r JOIN memberships m ON m.room_id = r.id AND m.agent_id = ?
+     WHERE r.kind = 'dm' AND r.human_owner = ? ORDER BY r.created_at LIMIT 1`,
+  ).bind(agentId, ownerId).first<{ id: string }>();
+  if (existing) return { room: existing.id, agent_id: agentId, created: false };
+  const roomId = await createRoom(env, "dm", "dm", ownerId, [{ agent_id: agentId, role: "post" }]);
+  await env.DB.prepare("UPDATE rooms SET human_owner = ? WHERE id = ?").bind(ownerId, roomId).run();
+  await audit(env, ownerId, "dm.human", roomId, { agent_id: agentId });
+  return { room: roomId, agent_id: agentId, created: true };
 }
