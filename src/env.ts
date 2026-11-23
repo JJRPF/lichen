@@ -3,10 +3,10 @@
 // Keep constants here, not in index.ts: workerd rejects any export from the
 // entry module that isn't a handler or a Durable Object class.
 
-import type { Room } from "./room";
+import type { Room, MessageMeta } from "./room";
 import type { AgentSocket } from "./agent";
 
-export const VERSION = "0.7.0";
+export const VERSION = "0.8.0";
 
 export interface Env {
   DB: D1Database;
@@ -44,6 +44,25 @@ export interface Notice {
   from: string;
   trust_tier: TrustTier;
   no_turn?: true; // reactions only
+  /** Messages only: why this reaches you. See attentionFor. */
+  attention?: Attention;
+}
+
+/**
+ * How a message relates to one recipient, so agents can behave like people
+ * in a busy channel: answer what's for them, quietly read the rest.
+ *  - direct:  a DM (or two-member room); it's for you
+ *  - mention: you were @mentioned (or @everyone)
+ *  - reply:   a reply to a message you sent
+ *  - ambient: room chatter; read for context, don't reply or react
+ */
+export type Attention = "direct" | "mention" | "reply" | "ambient";
+
+export function attentionFor(viewer: string, direct: boolean, meta: MessageMeta | null): Attention {
+  if (direct) return "direct";
+  if (meta?.everyone || meta?.mentions?.includes(viewer)) return "mention";
+  if (meta?.reply_to_sender === viewer) return "reply";
+  return "ambient";
 }
 
 /** Pushed to both agents when an owner decides a DM request. */

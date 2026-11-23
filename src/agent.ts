@@ -24,6 +24,7 @@ export interface WebhookInfo {
   id: string;
   url: string;
   include_reactions: boolean;
+  include_ambient: boolean;
   authorization: "set" | null;
   created_at: number;
   status: "active" | "disabled";
@@ -38,7 +39,7 @@ export interface WebhookInfo {
 
 type WebhookRow = {
   id: string; url: string; secret: string; auth: string | null; origin: string; agent_id: string;
-  include_reactions: number; created_at: number; disabled_at: number | null; last_status: number | null;
+  include_reactions: number; include_ambient: number; created_at: number; disabled_at: number | null; last_status: number | null;
   last_error: string | null; last_at: number | null; failures: number; delivered: number;
 };
 
@@ -74,6 +75,9 @@ export class AgentSocket extends DurableObject<Env> {
       );
       CREATE INDEX IF NOT EXISTS deliveries_due ON deliveries(next_at);
     `);
+    // 0.8: webhooks skip ambient room chatter unless asked.
+    const cols = this.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('webhooks')").toArray().map((c) => c.name);
+    if (!cols.includes("include_ambient")) this.sql.exec("ALTER TABLE webhooks ADD COLUMN include_ambient INTEGER NOT NULL DEFAULT 0");
   }
 
   /** WebSocket upgrade, forwarded by the Worker after it checked the token. */
@@ -112,7 +116,7 @@ export class AgentSocket extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- webhooks
 
-  async addWebhook(opts: { agentId: string; origin: string; url: string; authorization?: string; includeReactions: boolean }) {
+  async addWebhook(opts: { agentId: string; origin: string; url: string; authorization?: string; includeReactions: boolean; includeAmbient?: boolean }) {
     // Errors are returned, not thrown: HttpError doesn't survive the RPC boundary.
     const active = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM webhooks").one().n;
     if (active >= MAX_WEBHOOKS_PER_AGENT) return { error: "too_many_webhooks" as const, message: `At most ${MAX_WEBHOOKS_PER_AGENT} webhooks per agent` };
@@ -123,8 +127,8 @@ export class AgentSocket extends DurableObject<Env> {
     const secret = newWebhookSecret();
     const now = Date.now();
     this.sql.exec(
-      `INSERT INTO webhooks (id, url, secret, auth, origin, agent_id, include_reactions, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, opts.url, secret, opts.authorization ?? null, opts.origin, opts.agentId, opts.includeReactions ? 1 : 0, now,
+      `INSERT INTO webhooks (id, url, secret, auth, origin, agent_id, include_reactions, include_ambient, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, opts.url, secret, opts.authorization ?? null, opts.origin, opts.agentId, opts.includeReactions ? 1 : 0, opts.includeAmbient ? 1 : 0, now,
     );
     return { webhook: { ...this.info(this.row(id)!), secret } };
   }
@@ -166,7 +170,7 @@ export class AgentSocket extends DurableObject<Env> {
   private info(r: WebhookRow): WebhookInfo {
     const pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM deliveries WHERE webhook_id = ?", r.id).one().n;
     return {
-      id: r.id, url: r.url, include_reactions: !!r.include_reactions, authorization: r.auth ? "set" : null,
+      id: r.id, url: r.url, include_reactions: !!r.include_reactions, include_ambient: !!r.include_ambient, authorization: r.auth ? "set" : null,
       created_at: r.created_at, status: r.disabled_at ? "disabled" : "active", disabled_at: r.disabled_at,
       delivered: r.delivered, failures: r.failures, last_status: r.last_status, last_error: r.last_error,
       last_at: r.last_at, pending,
@@ -180,6 +184,8 @@ export class AgentSocket extends DurableObject<Env> {
     const now = Date.now();
     for (const w of hooks) {
       if ("no_turn" in event && event.no_turn && !w.include_reactions) continue;
+      // Ambient room chatter doesn't need to wake anyone.
+      if ("attention" in event && event.attention === "ambient" && !w.include_ambient) continue;
       const body = JSON.stringify(payloadFor(w.agent_id, w.origin, event, now));
       this.sql.exec(
         "INSERT INTO deliveries (id, webhook_id, body, attempt, next_at, created_at) VALUES (?, ?, ?, 0, ?, ?)",

@@ -77,7 +77,7 @@ describe("/ws", () => {
     expect(sent.status).toBe(201);
 
     const notice = await sb.next();
-    expect(notice).toEqual({ id: sent.data.id, room: roomId, from: a.agent_id, trust_tier: "same_owner" });
+    expect(notice).toEqual({ id: sent.data.id, room: roomId, from: a.agent_id, trust_tier: "same_owner", attention: "direct" });
     expect(JSON.stringify(notice)).not.toContain("secret plans");
 
     // The sender doesn't get a notice for its own message.
@@ -99,7 +99,7 @@ describe("/ws", () => {
 
     const sent = await call("/send", { token: mine.token, body: { room: roomId, body: "hi", trust_tier: "same_owner" } });
     expect((await s2.next()).trust_tier).toBe("same_owner");
-    expect(await st.next()).toEqual({ id: sent.data.id, room: roomId, from: mine.agent_id, trust_tier: "external" });
+    expect(await st.next()).toEqual({ id: sent.data.id, room: roomId, from: mine.agent_id, trust_tier: "external", attention: "ambient" });
 
     const r = await call("/react", { token: theirs.token, body: { message_id: sent.data.id, emoji: "👍" } });
     expect(r.status).toBe(201);
@@ -168,6 +168,6 @@ describe("worker entry module", () => {
       const ok = typeof value === "function" || (name === "default" && typeof value === "object");
       expect(ok, `export ${name}`).toBe(true);
     }
-    expect((await call("/")).data.version).toBe("0.7.0");
+    expect((await call("/")).data.version).toBe("0.8.0");
   });
 });
