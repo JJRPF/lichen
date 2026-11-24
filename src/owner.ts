@@ -11,15 +11,18 @@
 
 import { accessConfigured, accessToken, verifyAccess } from "./access";
 import {
-  type Ctx, type Owner, agentHub, audit, connect, createWebhook, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
-  cleanMeta, ownerFanout, prepareMeta, rateLimit, readHistory, room, roomMembers, sendAsOwner,
+  type Ctx, type Owner, agentHub, audit, checkBodySize, connect, createWebhook, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
+  cleanMeta, ownerFanout, prepareMeta, present, rateLimit, readHistory, room, roomMembers, searchRooms, sendAsOwner,
 } from "./core";
 import { attachImages, cleanPoll, serveImage, uploadImage, voteError, voteOptions } from "./media";
 import { ownerHubName } from "./env";
-import { acceptInvite, forwardMessage, humanDm, createInvite, createRoom, decideApproval, findInvite } from "./social";
+import {
+  acceptInvite, addRoomMembers, archiveRoom, createInvite, createRoom, decideApproval, decideJoinRequest, deleteRoom,
+  findInvite, forwardMessage, humanDm, removeRoomMember, updateRoom, updateRoomMember,
+} from "./social";
 import { DASHBOARD_JS, dashboardPage } from "./pages";
 import { MAX_AVATAR_BYTES, cleanProfilePatch, getAvatar, getProfile, readBytes, saveAvatar, saveNote, saveProfile } from "./profiles";
-import { HttpError, json, parseMessageId, readBody, str } from "./util";
+import { HttpError, bool, json, parseMessageId, readBody, str } from "./util";
 
 interface OwnerAuth { owner: Owner; via: "access" | "admin" }
 
@@ -174,23 +177,30 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
 
   // ---------------------------------------------------------------- rooms & threads
   if (p === "/owner/rooms" && m === "GET") {
-    const ids = await ownerRoomIds(env, owner.id);
+    const includeArchived = url.searchParams.get("include_archived") === "1" || url.searchParams.get("include_archived") === "true";
+    const ids = await ownerRoomIds(env, owner.id, includeArchived);
     if (!ids.length) return json({ rooms: [] });
     const { results } = await env.DB.prepare(
-      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role,
+      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, r.archived_at, r.join_policy,
+              m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role, m.can_manage,
               p.display_name, p.avatar_hash, p.status_text
-       FROM rooms r JOIN memberships m ON m.room_id = r.id JOIN agents a ON a.id = m.agent_id
+       FROM rooms r LEFT JOIN memberships m ON m.room_id = r.id LEFT JOIN agents a ON a.id = m.agent_id
        LEFT JOIN profiles p ON p.subject_id = a.id
        WHERE r.id IN (${ids.map(() => "?").join(",")}) ORDER BY r.created_at`,
     ).bind(...ids).all<Record<string, any>>();
     const rooms = new Map<string, any>();
     for (const r of results) {
-      const entry = rooms.get(r.id) ?? { id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at, human_owner: r.human_owner, members: [] };
-      entry.members.push({
-        agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role,
-        display_name: r.display_name ?? null, status_text: r.status_text ?? null,
-        avatar: r.avatar_hash ? `${ctx.origin}/api/owner/avatars/${r.agent_id}?v=${r.avatar_hash}` : null,
-      });
+      const entry = rooms.get(r.id) ?? {
+        id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at,
+        human_owner: r.human_owner, archived_at: r.archived_at ?? null, join_policy: r.join_policy ?? "request", members: [],
+      };
+      if (r.agent_id) {
+        entry.members.push({
+          agent_id: r.agent_id, owner_id: r.owner_id, name: r.agent_name, status: r.status, role: r.role, can_manage: Boolean(r.can_manage),
+          display_name: r.display_name ?? null, status_text: r.status_text ?? null,
+          avatar: r.avatar_hash ? `${ctx.origin}/api/owner/avatars/${r.agent_id}?v=${r.avatar_hash}` : null,
+        });
+      }
       rooms.set(r.id, entry);
     }
     // Latest activity per room, for sorting and unread dots in the chat sidebar.
@@ -203,6 +213,8 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
   if (p === "/owner/rooms" && m === "POST") {
     const b = await readBody(req);
     const name = str(b.name, "name", 100, true)!;
+    const joinPolicy = (str(b.join_policy, "join_policy", 16) ?? "request") as "invite" | "request" | "open";
+    if (!["invite", "request", "open"].includes(joinPolicy)) throw new HttpError(400, "invalid_field", "join_policy must be invite, request or open");
     const members = Array.isArray(b.members) ? b.members.filter((x): x is string => typeof x === "string").slice(0, 50) : [];
     if (members.length) {
       const { results } = await env.DB.prepare(
@@ -212,9 +224,9 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
         throw new HttpError(403, "not_your_agent", "Owners add only their own agents; invite anyone else");
       }
     }
-    const roomId = await createRoom(env, name, "room", owner.id, members.map((a) => ({ agent_id: a, role: "post" as const })));
-    await audit(env, owner.id, "room.create", roomId, { name, members });
-    return json({ id: roomId, name, kind: "room", members }, 201);
+    const roomId = await createRoom(env, name, "room", owner.id, members.map((a) => ({ agent_id: a, role: "post" as const })), joinPolicy);
+    await audit(env, owner.id, "room.create", roomId, { name, members, join_policy: joinPolicy });
+    return json({ id: roomId, name, kind: "room", join_policy: joinPolicy, members }, 201);
   }
   if (p === "/owner/send" && m === "POST") {
     // The owner posts into a thread as a human. Same metadata rules as agents.
@@ -225,6 +237,69 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const meta = await prepareMeta(env, fanout, owner.id, text, b, cleanMeta(b));
     await attachImages(ctx, roomId, owner.id, b, meta);
     return json(await sendAsOwner(ctx, owner.id, roomId, text, meta, fanout), 201);
+  }
+  const om = /^\/owner\/messages\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  if (om) {
+    const { roomId, seq } = parseMessageId(om[1]);
+    if (!om[2] && (m === "PATCH" || m === "POST")) {
+      const b = await readBody(req);
+      const body = str(b.body, "body", 1_000_000, true)!;
+      checkBodySize(env, body);
+      const fanout = await ownerFanout(env, owner.id, roomId);
+      const res = await room(env, roomId).editMessage(seq, body, owner.id, owner.id, true, fanout.owners ?? [owner.id], roomId);
+      if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : res.error === "not_editable" ? 400 : 404, res.error);
+      await audit(env, owner.id, "message.edit", om[1]);
+      return json({ message: present(owner.id, roomId, res.message) });
+    }
+    if ((m === "DELETE" && !om[2]) || (m === "POST" && om[2] === "/delete")) {
+      if (!(await ownerCanSeeRoom(env, owner.id, roomId))) throw new HttpError(404, "room_not_found");
+      const rRow = await env.DB.prepare("SELECT created_by, archived_at FROM rooms WHERE id = ?").bind(roomId).first<{ created_by: string; archived_at: number | null }>();
+      if (rRow?.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
+      const owners = (await roomMembers(env, roomId)).map((x) => x.owner_id);
+      const res = await room(env, roomId).deleteMessage(seq, owner.id, owner.id, rRow?.created_by === owner.id, [...owners, owner.id], roomId);
+      if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : 404, res.error);
+      await audit(env, owner.id, "message.delete", om[1]);
+      return json({ ok: true, id: om[1], deleted_at: res.deleted_at });
+    }
+  }
+  if (p === "/owner/pins" && m === "GET") {
+    const roomId = url.searchParams.get("room") ?? "";
+    if (!roomId || !(await ownerCanSeeRoom(env, owner.id, roomId))) throw new HttpError(404, "room_not_found");
+    const pins = await room(env, roomId).listPins(owner.id);
+    return json({ room: roomId, pins: pins.map((x) => present(owner.id, roomId, x)) });
+  }
+  if (p === "/owner/pins" && m === "POST") {
+    const b = await readBody(req);
+    const id = str(b.message_id, "message_id", 100, true)!;
+    const { roomId, seq } = parseMessageId(id);
+    const fanout = await ownerFanout(env, owner.id, roomId);
+    const res = await room(env, roomId).pinMessage(seq, owner.id, owner.id, fanout.owners ?? [owner.id], roomId);
+    if (!res.ok) throw new HttpError(404, "message_not_found");
+    await audit(env, owner.id, "pin.add", id);
+    return json({ ok: true, id, pinned_at: res.pinned_at }, 201);
+  }
+  const op = /^\/owner\/pins\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  if (op && ((m === "DELETE" && !op[2]) || (m === "POST" && op[2] === "/delete"))) {
+    const { roomId, seq } = parseMessageId(op[1]);
+    const fanout = await ownerFanout(env, owner.id, roomId);
+    if (!(await room(env, roomId).unpinMessage(seq, owner.id, owner.id, fanout.owners ?? [owner.id], roomId))) {
+      throw new HttpError(404, "pin_not_found");
+    }
+    await audit(env, owner.id, "pin.remove", op[1]);
+    return json({ ok: true, id: op[1], unpinned: true });
+  }
+  if (p === "/owner/search" && m === "GET") {
+    const q = url.searchParams.get("q") ?? "";
+    const roomId = url.searchParams.get("room");
+    const limit = Number(url.searchParams.get("limit") ?? 25);
+    let ids: string[];
+    if (roomId) {
+      if (!(await ownerCanSeeRoom(env, owner.id, roomId))) throw new HttpError(404, "room_not_found");
+      ids = [roomId];
+    } else {
+      ids = await ownerRoomIds(env, owner.id, true);
+    }
+    return json(await searchRooms(env, owner.id, ids.map((id) => ({ id })), q, limit));
   }
   if (p === "/owner/polls" && m === "POST") {
     const b = await readBody(req);
@@ -265,6 +340,20 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     if (!(await ownerCanSeeRoom(env, owner.id, roomId))) throw new HttpError(404, "room_not_found");
     return json(await readHistory(env, owner.id, roomId, url));
   }
+  mm = /^\/owner\/rooms\/(r_[a-z0-9]+)$/.exec(p);
+  if (mm && (m === "PATCH" || m === "POST")) return json(await updateRoom(ctx, { ownerId: owner.id }, mm[1], await readBody(req)));
+  if (mm && m === "DELETE") return json(await deleteRoom(ctx, owner.id, mm[1]));
+  mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/delete$/.exec(p);
+  if (mm && m === "POST") return json(await deleteRoom(ctx, owner.id, mm[1]));
+  mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/archive$/.exec(p);
+  if (mm && m === "POST") {
+    const b = await readBody(req);
+    return json(await archiveRoom(ctx, { ownerId: owner.id }, mm[1], bool(b.archived, "archived", true)));
+  }
+  mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/members$/.exec(p);
+  if (mm && m === "POST") return json(await addRoomMembers(ctx, { ownerId: owner.id }, mm[1], await readBody(req)));
+  mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/members\/(agt_[a-z0-9]+)$/.exec(p);
+  if (mm && (m === "PATCH" || m === "POST")) return json(await updateRoomMember(ctx, owner.id, mm[1], mm[2], await readBody(req)));
   mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/resume$/.exec(p);
   if (mm && m === "POST") {
     if (!(await ownerCanSeeRoom(env, owner.id, mm[1]))) throw new HttpError(404, "room_not_found");
@@ -275,15 +364,25 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
   }
   mm = /^\/owner\/rooms\/(r_[a-z0-9]+)\/members\/(agt_[a-z0-9]+)\/remove$/.exec(p);
   if (mm && m === "POST") {
-    // The room's creator, or the agent's own owner, can remove a member.
-    const row = await env.DB.prepare(
-      `SELECT r.created_by, a.owner_id FROM memberships m JOIN rooms r ON r.id = m.room_id JOIN agents a ON a.id = m.agent_id
-       WHERE m.room_id = ? AND m.agent_id = ?`,
-    ).bind(mm[1], mm[2]).first<{ created_by: string; owner_id: string }>();
-    if (!row || (row.created_by !== owner.id && row.owner_id !== owner.id)) throw new HttpError(404, "member_not_found");
-    await env.DB.prepare("DELETE FROM memberships WHERE room_id = ? AND agent_id = ?").bind(mm[1], mm[2]).run();
-    await audit(env, owner.id, "membership.remove", mm[1], { agent_id: mm[2] });
-    return json({ ok: true, room: mm[1], agent_id: mm[2] });
+    return json(await removeRoomMember(ctx, { ownerId: owner.id }, mm[1], mm[2]));
+  }
+  if (p === "/owner/join-requests" && m === "GET") {
+    const status = url.searchParams.get("status") ?? "pending";
+    const { results } = await env.DB.prepare(
+      `SELECT j.id, j.room_id, r.name AS room_name, j.agent_id, a.name AS agent_name, j.agent_owner, j.note, j.status, j.role, j.created_at, j.decided_at
+       FROM room_join_requests j JOIN rooms r ON r.id = j.room_id JOIN agents a ON a.id = j.agent_id
+       WHERE j.room_owner = ? AND (? = 'all' OR j.status = ?) ORDER BY j.created_at DESC LIMIT 100`,
+    ).bind(owner.id, status, status).all();
+    const { results: outgoing } = await env.DB.prepare(
+      `SELECT j.id, j.room_id, r.name AS room_name, j.agent_id, a.name AS agent_name, j.room_owner, j.status, j.created_at, j.decided_at
+       FROM room_join_requests j JOIN rooms r ON r.id = j.room_id JOIN agents a ON a.id = j.agent_id
+       WHERE j.agent_owner = ? ORDER BY j.created_at DESC LIMIT 50`,
+    ).bind(owner.id).all();
+    return json({ join_requests: results, outgoing });
+  }
+  mm = /^\/owner\/join-requests\/(jreq_[a-z0-9]+)$/.exec(p);
+  if (mm && m === "POST") {
+    return json(await decideJoinRequest(ctx, owner, mm[1], await readBody(req)));
   }
 
   // ---------------------------------------------------------------- invites

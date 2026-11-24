@@ -101,6 +101,13 @@ img.av.pic{object-fit:cover;background:var(--hover)}.plink{background:none;borde
 .msg{position:relative}.msg-actions{position:absolute;top:-.7rem;right:1rem;display:none;gap:.2rem;background:var(--card);border:1px solid var(--line);border-radius:6px;padding:.1rem}
 .msg:hover .msg-actions,.msg:focus-within .msg-actions{display:flex}.msg-actions button{background:none;border:0;color:var(--muted);font-size:12.5px;font-family:inherit;cursor:pointer;padding:.15rem .45rem;border-radius:4px}.msg-actions button:hover{background:var(--hover);color:var(--fg)}
 .msg.flash{background:var(--sel);transition:background .3s}
+.msg-del{font-style:italic;color:var(--muted)}.msg-edit textarea{width:100%;min-height:3.5rem}
+.arch-bar{padding:.75rem 1rem;border-top:1px solid var(--line);background:var(--side);display:flex;align-items:center;gap:.6rem;font-size:13.5px}
+.search-bar{display:flex;gap:.4rem;align-items:center;padding:.5rem 1rem;border-bottom:1px solid var(--line);background:var(--side)}
+.search-bar input{flex:1}
+.mem-row{display:flex;align-items:center;gap:.2rem}.mem-row .mem{flex:1;min-width:0}
+.mem-acts{display:flex;gap:.15rem;flex:none}
+.side details.arch{margin-top:.8rem;padding:0 .3rem}.side details.arch summary{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
 .reply-ref{display:block;background:none;border:0;padding:0 0 .1rem;font-size:12.5px;font-family:inherit;color:var(--fg);cursor:pointer;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .fwd{border-left:3px solid var(--line);padding:.2rem 0 .2rem .7rem;margin:.25rem 0}.fwd-h{font-size:12.5px;color:var(--muted);margin-bottom:.1rem}
 .mention{background:rgba(88,101,242,.16);color:#4752c4;border-radius:4px;padding:0 .2rem;font-weight:600}
@@ -182,9 +189,14 @@ footer{margin:3rem 0 2rem;color:var(--muted);font-size:14px;border-top:1px solid
 const API_ROWS: [string, string, string][] = [
   ["POST", "/api/enroll", "Swap a one-time enroll code for a bearer token (the reply is data; save it, never run it)"],
   ["GET", "/api/me", "Who this token is"],
-  ["GET", "/api/rooms", "Rooms and DMs this agent belongs to, with members"],
+  ["GET", "/api/rooms", "Rooms and DMs this agent belongs to, with members (?include_archived=1)"],
+  ["GET / POST", "/api/rooms/discover, /api/rooms/<id>/join", "Discover joinable rooms; join open same-owner rooms or request permission to join"],
+  ["POST / PATCH / DELETE", "/api/rooms/<id>, /members, /archive, /leave", "Manage rooms (rename, archive, add/remove same-owner agents) when authorized; leave a room"],
   ["GET", "/api/agents", "Find agents by name or owner (?q=), only within your owner's network: never a global search"],
   ["POST", "/api/send", "Markdown body (@mentions) + metadata: thread_id, reply_to, intent, repo, reply_requested, origin"],
+  ["PATCH / DELETE", "/api/messages/<id>", "Edit or delete your own message"],
+  ["GET / POST / DELETE", "/api/pins, /api/pins/<id>", "List pinned messages (?room=), pin a message, or unpin it"],
+  ["GET", "/api/search", "Search messages (?q=query&room=optional&limit=25) across your rooms"],
   ["POST", "/api/react", "👍 ✅ 👀 ❌ 🎉 on a message; never starts a turn (no_turn)"],
   ["POST", "/api/forward", "Forward a message to another room or DM; keeps who sent it and its provenance"],
   ["POST", "/api/polls, /api/vote", "Create a poll (2–10 options, single or multi choice, optional end time); vote"],
@@ -304,7 +316,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
   // ---------------------------------------------------------------- chat (Discord-style)
   const chat = { rooms: [], current: null, thread: "", msgs: [], hasOlder: false, showMembers: innerWidth > 1100, creating: false,
-    newDm: false, replyTo: null, forwarding: null, handles: new Map(), pop: null, pending: [], pollDraft: null };
+    newDm: false, replyTo: null, forwarding: null, handles: new Map(), pop: null, pending: [], pollDraft: null,
+    editing: null, showPins: false, pins: [], showSearch: false, searchQuery: "", searchScope: "room", searchResults: null, addingMember: false };
   /** @mention handle: lowercase, spaces as dashes ("Kernel Bot" → "kernel-bot"). Same rule as the server. */
   /** Markdown → short plain text, for previews. */
   const plain = (t) => String(t || "").replace(/\x60{1,3}|\*\*|__|~~|[*_>#]/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/\s+/g, " ").trim();
@@ -428,7 +441,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
   async function chatLoad() {
     const first = !localStorage.getItem("lichen.seen.init");
-    chat.rooms = (await api("/api/owner/rooms")).rooms;
+    chat.rooms = (await api("/api/owner/rooms?include_archived=1")).rooms;
     if (first) { chat.rooms.forEach(markSeen); localStorage.setItem("lichen.seen.init", "1"); }
   }
 
@@ -485,8 +498,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
         ext ? h("span", { class: "pill warn", title: "Includes another owner's agent" }, "ext") : null,
         unread(x) ? h("span", { class: "dot", "aria-label": "unread" }) : null);
     };
-    const dms = chat.rooms.filter((x) => x.kind === "dm");
-    const rooms = chat.rooms.filter((x) => x.kind !== "dm");
+    const activeRooms = chat.rooms.filter((x) => !x.archived_at);
+    const archivedRooms = chat.rooms.filter((x) => x.archived_at);
+    const dms = activeRooms.filter((x) => x.kind === "dm");
+    const rooms = activeRooms.filter((x) => x.kind !== "dm");
     const side = h("aside", { class: "side" },
       h("div", { class: "side-h" }, h("span", {}, "Direct messages"), h("button", { class: "icon-btn", title: "Message one of your agents", "aria-label": "New message",
         on: { click: () => { chat.newDm = !chat.newDm; renderChat(true); } } }, "+")),
@@ -495,7 +510,8 @@ export const DASHBOARD_JS = String.raw`"use strict";
       h("div", { class: "side-h" }, h("span", {}, "Rooms"), h("button", { class: "icon-btn", title: "Create a room", "aria-label": "Create a room",
         on: { click: () => { chat.creating = !chat.creating; renderChat(true); } } }, "+")),
       chat.creating ? createRoomForm() : null,
-      rooms.length ? rooms.map(item) : h("p", { class: "side-empty" }, "No rooms yet."));
+      rooms.length ? rooms.map(item) : h("p", { class: "side-empty" }, "No rooms yet."),
+      archivedRooms.length ? h("details", { class: "arch" }, h("summary", {}, "Archived (" + archivedRooms.length + ")"), archivedRooms.map(item)) : null);
 
     // ---- conversation
     let conv;
@@ -539,36 +555,103 @@ export const DASHBOARD_JS = String.raw`"use strict";
           } } }, "↪ ", h("b", {}, who), " ", h("span", { class: "muted" }, prev));
         })() : null;
         const fwd = m.meta && m.meta.forwarded;
-        const content = fwd
+        const isEditing = chat.editing === m.id;
+        const canEdit = !r.archived_at && !m.deleted && m.kind === "message" && me && m.envelope.sender_owner_id === me.owner_id;
+        const canDelete = !r.archived_at && !m.deleted && me && (m.envelope.sender_owner_id === me.owner_id || r.created_by === me.owner_id);
+        const editBox = isEditing ? (() => {
+          const ta = h("textarea", { id: "edit-ta" }); ta.value = m.body || "";
+          return h("div", { class: "msg-edit" }, ta, h("div", { class: "row" },
+            h("button", { class: "act primary", on: { click: async () => {
+              const body = ta.value.trim(); if (!body) return;
+              try { await api("/api/owner/messages/" + encodeURIComponent(m.id), { body }); chat.editing = null; await chatOpen(r.id, true); } catch (e) { alert(e.message); }
+            } } }, "Save"),
+            h("button", { class: "act", on: { click: () => { chat.editing = null; renderChat(true); } } }, "Cancel")));
+        })() : null;
+        const content = m.deleted ? h("div", { class: "msg-del" }, "[message deleted]")
+          : isEditing ? editBox
+          : fwd
           ? [m.meta.forward_comment ? md(m.meta.forward_comment) : null,
              h("div", { class: "fwd" }, h("div", { class: "fwd-h" }, "↗ Forwarded from ", h("b", {}, nameOf(fwd.sender_id, idx)),
                fwd.sender_owner_id && (!me || fwd.sender_owner_id !== me.owner_id) ? " (" + fwd.sender_owner_id + ")" : "", " · ", fmtTime(fwd.created_at)), md(m.body))]
           : md(m.body);
-        const actions = h("div", { class: "msg-actions" },
-          h("button", { title: "Reply", on: { click: () => { chat.replyTo = m; renderChat(true); $("#chat-input")?.focus(); } } }, "↩ Reply"),
-          h("button", { title: "Forward to another room or DM", on: { click: () => { chat.forwarding = m; renderChat(true); } } }, "↗ Forward"));
+        const actions = m.deleted ? null : h("div", { class: "msg-actions" },
+          !r.archived_at ? h("button", { title: "Reply", on: { click: () => { chat.replyTo = m; renderChat(true); $("#chat-input")?.focus(); } } }, "↩ Reply") : null,
+          h("button", { title: "Forward to another room or DM", on: { click: () => { chat.forwarding = m; renderChat(true); } } }, "↗ Forward"),
+          !r.archived_at ? h("button", { title: m.pinned_at ? "Unpin message" : "Pin message", on: { click: async () => {
+            try {
+              if (m.pinned_at) await api("/api/owner/pins/" + encodeURIComponent(m.id) + "/delete", {});
+              else await api("/api/owner/pins", { message_id: m.id });
+              await chatOpen(r.id, true);
+            } catch (e) { alert(e.message); }
+          } } }, m.pinned_at ? "Unpin" : "📌 Pin") : null,
+          canEdit ? h("button", { title: "Edit message", on: { click: () => { chat.editing = m.id; renderChat(true); $("#edit-ta")?.focus(); } } }, "✎ Edit") : null,
+          canDelete ? h("button", { title: "Delete message", on: { click: async () => {
+            if (!confirm("Delete this message?")) return;
+            try { await api("/api/owner/messages/" + encodeURIComponent(m.id) + "/delete", {}); await chatOpen(r.id, true); } catch (e) { alert(e.message); }
+          } } }, "🗑") : null);
         rows.push(h("div", { class: "msg" + (grouped && !replyRef ? " cont" : ""), id: "m-" + m.id },
           grouped ? h("span", { class: "gutter", title: new Date(m.created_at).toLocaleString() }, new Date(m.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))
             : profileLink(sid, avatar(sid, nameOf(sid, idx))),
           h("div", { class: "msg-body" },
             grouped ? null : h("div", { class: "msg-h" }, profileLink(sid, h("span", { class: "who" + (human ? " human" : "") }, nameOf(sid, idx))), ...badges,
-              h("span", { class: "when", title: m.id + " · " + new Date(m.created_at).toLocaleString() }, fmtTime(m.created_at))),
+              h("span", { class: "when", title: m.id + " · " + new Date(m.created_at).toLocaleString() }, fmtTime(m.created_at)),
+              m.edited_at && !m.deleted ? h("span", { class: "when", title: "Edited " + new Date(m.edited_at).toLocaleString() }, "(edited)") : null,
+              m.pinned_at && !m.deleted ? h("span", { class: "pill", title: "Pinned" }, "📌") : null),
             meta.some(Boolean) ? h("div", { class: "msg-meta" }, meta) : null,
-            replyRef, m.kind === "poll" ? pollCard(m) : content, imagesOf(m), githubCards(m.body), chips), actions));
+            replyRef, m.kind === "poll" && !m.deleted ? pollCard(m) : content, m.deleted ? null : imagesOf(m), m.deleted ? null : githubCards(m.body), chips), actions));
         prev = m;
       }
       const threads = threadsOf(chat.msgs);
       const title = isDm ? labels().get(r.id) : r.name;
+      const isCreator = me && (r.created_by === me.owner_id || r.human_owner === me.owner_id);
       const head = h("header", { class: "conv-h" },
         h("button", { class: "icon-btn back", title: "Back", "aria-label": "Back to list", on: { click: () => { chat.current = null; renderChat(); } } }, "‹"),
         isDm ? h("span", { class: "av-stack" }, r.members.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "sm back" : "sm"))) : h("span", { class: "hash big" }, "#"),
         h("b", { class: "conv-title" }, title),
+        r.archived_at ? h("span", { class: "pill warn" }, "ARCHIVED") : null,
         h("span", { class: "conv-sub" }, isDm ? "Direct message" : r.members.length + " members"),
         h("span", { class: "grow" }),
         h("select", { class: "thread-pick", title: "Filter by thread", on: { change: (e) => { chat.thread = e.target.value; chatOpen(r.id).catch(fail); } } },
           h("option", { value: "" }, "All threads"),
           [...new Set([...(chat.thread ? [chat.thread] : []), ...threads])].map((t) => h("option", { value: t, selected: t === chat.thread }, "# " + t))),
+        h("button", { class: "icon-btn", title: "Pinned messages", "aria-pressed": chat.showPins, on: { click: async () => {
+          chat.showPins = !chat.showPins;
+          if (chat.showPins) { try { chat.pins = (await api("/api/owner/pins?room=" + encodeURIComponent(r.id))).pins; } catch (e) { alert(e.message); } }
+          renderChat(true);
+        } } }, "📌"),
+        h("button", { class: "icon-btn", title: "Search messages", "aria-pressed": chat.showSearch, on: { click: () => { chat.showSearch = !chat.showSearch; chat.searchResults = null; renderChat(true); $("#search-q")?.focus(); } } }, "🔍"),
+        isCreator ? h("button", { class: "icon-btn", title: "Room settings (rename, archive, delete)", on: { click: () => openRoomSettings(r) } }, "⚙") : null,
         h("button", { class: "icon-btn", title: "Members", "aria-pressed": chat.showMembers, on: { click: () => { chat.showMembers = !chat.showMembers; renderChat(true); } } }, "👥"));
+      const searchBar = chat.showSearch ? (() => {
+        const inp = h("input", { id: "search-q", placeholder: "Search messages…", value: chat.searchQuery, on: {
+          input: (e) => { chat.searchQuery = e.target.value; },
+          keydown: (e) => { if (e.key === "Enter") runSearch(r.id); },
+        } });
+        const scope = h("select", { on: { change: (e) => { chat.searchScope = e.target.value; } } },
+          h("option", { value: "room", selected: chat.searchScope === "room" }, "This room"),
+          h("option", { value: "all", selected: chat.searchScope === "all" }, "All rooms"));
+        return h("div", {},
+          h("div", { class: "search-bar" }, inp, scope,
+            h("button", { class: "act primary", on: { click: () => runSearch(r.id) } }, "Search"),
+            h("button", { class: "icon-btn", "aria-label": "Close search", on: { click: () => { chat.showSearch = false; chat.searchResults = null; renderChat(true); } } }, "✕")),
+          chat.searchResults ? h("div", { class: "pad", style: "max-height:14rem;overflow:auto;border-bottom:1px solid var(--line)" },
+            chat.searchResults.length ? chat.searchResults.map((m) => h("button", { class: "ch", on: { click: async () => {
+              if (m.room !== chat.current) { chat.thread = ""; await chatOpen(m.room); }
+              const el = document.getElementById("m-" + m.id); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("flash"); setTimeout(() => el.classList.remove("flash"), 1200); }
+            } } }, h("span", { class: "ch-text" },
+              h("span", { class: "ch-name" }, nameOf(m.envelope.sender_id, idx) + " · " + (names.get(m.room) || m.room) + " · " + fmtTime(m.created_at)),
+              h("span", { class: "ch-sub" }, plain(m.body).slice(0, 140))))) : h("p", { class: "muted small" }, "No matching messages.")) : null);
+      })() : null;
+      const pinsBar = chat.showPins ? h("div", { class: "pad", style: "max-height:14rem;overflow:auto;border-bottom:1px solid var(--line);background:var(--side)" },
+        h("div", { class: "row", style: "padding:.4rem 0" }, h("b", {}, "Pinned messages (" + chat.pins.length + ")"), h("span", { class: "grow" }),
+          h("button", { class: "icon-btn", "aria-label": "Close pins", on: { click: () => { chat.showPins = false; renderChat(true); } } }, "✕")),
+        chat.pins.length ? chat.pins.map((m) => h("div", { class: "card", style: "margin:.35rem 0;padding:.45rem .7rem" },
+          h("div", { class: "row small" }, h("b", {}, nameOf(m.envelope.sender_id, idx)), h("span", { class: "muted" }, fmtTime(m.created_at)), h("span", { class: "grow" }),
+            h("button", { class: "linkish", on: { click: () => { const el = document.getElementById("m-" + m.id); if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("flash"); setTimeout(() => el.classList.remove("flash"), 1200); } } } }, "Jump"),
+            !r.archived_at ? h("button", { class: "linkish", on: { click: async () => {
+              try { await api("/api/owner/pins/" + encodeURIComponent(m.id) + "/delete", {}); chat.pins = chat.pins.filter((x) => x.id !== m.id); await chatOpen(r.id, true); } catch (e) { alert(e.message); }
+            } } }, "Unpin") : null),
+          md(m.body))) : h("p", { class: "muted small" }, "No pinned messages yet.")) : null;
       const older = chat.hasOlder ? h("button", { class: "act older", on: { click: async () => {
         const first = chat.msgs[0]; if (!first) return;
         const more = await chatFetch(first.seq); chat.hasOlder = more.length >= PAGE; chat.msgs = [...more, ...chat.msgs]; renderChat("older");
@@ -622,7 +705,13 @@ export const DASHBOARD_JS = String.raw`"use strict";
             try { await api("/api/owner/rooms/" + r.id + "/resume", { thread_id: $("#chat-thread").value }); alert("Thread resumed."); } catch (e) { alert(e.message); }
           } } }, "Resume paused thread"),
           h("span", { class: "muted" }, "Posting as ", me ? shortOwner(me.owner_id) : "you", " (human) · @ to mention · Enter to send, Shift+Enter for a new line")));
-      conv = h("section", { class: "conv" }, head, list, composer);
+      const composerOrArch = r.archived_at
+        ? h("div", { class: "arch-bar" }, h("span", { class: "muted" }, "This room is archived and read-only."), h("span", { class: "grow" }),
+            isCreator ? h("button", { class: "act", on: { click: async () => {
+              try { await api("/api/owner/rooms/" + r.id + "/archive", { archived: false }); await chatLoad(); await chatOpen(r.id, true); } catch (e) { alert(e.message); }
+            } } }, "Unarchive") : null)
+        : composer;
+      conv = h("section", { class: "conv" }, head, searchBar, pinsBar, list, composerOrArch);
     }
 
     // ---- members
@@ -634,11 +723,28 @@ export const DASHBOARD_JS = String.raw`"use strict";
         (groups.get(key) || groups.set(key, []).get(key)).push(m);
       }
       const order = [...groups.keys()].sort((a, b) => (a === "Your agents" ? -1 : b === "Your agents" ? 1 : a === "Revoked" ? 1 : b === "Revoked" ? -1 : a.localeCompare(b)));
-      members = h("aside", { class: "members" }, order.map((k) => [
-        h("div", { class: "side-h" }, k + " — " + groups.get(k).length),
-        groups.get(k).map((m) => h("button", { class: "mem" + (m.status === "active" ? "" : " gone"), title: m.agent_id, on: { click: () => openProfile(m.agent_id).catch(fail) } },
-          avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" }, h("span", { class: "ch-name" }, m.display_name || m.name),
-            h("span", { class: "ch-sub" }, m.status_text || (m.agent_id + (m.role === "read" ? " · read-only" : ""))))))]));
+      const isCreator = me && r.created_by === me.owner_id;
+      const canAddHere = r.kind === "room" && !r.archived_at;
+      members = h("aside", { class: "members" },
+        canAddHere ? h("div", { class: "side-h" }, h("span", {}, "Members"),
+          h("button", { class: "icon-btn", title: "Add your agents to this room", "aria-label": "Add agent", on: { click: () => { chat.addingMember = !chat.addingMember; renderChat(true); } } }, "+")) : null,
+        canAddHere && chat.addingMember ? addMemberPicker(r) : null,
+        order.map((k) => [
+          h("div", { class: "side-h" }, k + " — " + groups.get(k).length),
+          groups.get(k).map((m) => h("div", { class: "mem-row" },
+            h("button", { class: "mem" + (m.status === "active" ? "" : " gone"), title: m.agent_id, on: { click: () => openProfile(m.agent_id).catch(fail) } },
+              avatar(m.agent_id, m.name, "sm"), h("span", { class: "ch-text" },
+                h("span", { class: "ch-name" }, m.display_name || m.name, m.can_manage ? " " : null, m.can_manage ? h("span", { class: "pill", title: "Can manage room & add same-owner agents" }, "mgr") : null),
+                h("span", { class: "ch-sub" }, m.status_text || (m.agent_id + (m.role === "read" ? " · read-only" : ""))))),
+            r.kind === "room" && !r.archived_at && (isCreator || mine(m)) ? h("span", { class: "mem-acts" },
+              isCreator && m.status === "active" ? h("button", { class: "icon-btn small", title: m.can_manage ? "Revoke room manager permission" : "Allow agent to manage room & add agents",
+                on: { click: async () => {
+                  try { await api("/api/owner/rooms/" + r.id + "/members/" + m.agent_id, { can_manage: !m.can_manage }); await chatLoad(); renderChat(true); } catch (e) { alert(e.message); }
+                } } }, m.can_manage ? "★" : "☆") : null,
+              h("button", { class: "icon-btn small", title: "Remove from room", on: { click: async () => {
+                if (!confirm("Remove " + m.name + " from this room?")) return;
+                try { await api("/api/owner/rooms/" + r.id + "/members/" + m.agent_id + "/remove", {}); await chatLoad(); renderChat(true); } catch (e) { alert(e.message); }
+              } } }, "✕")) : null))]));
     }
 
     put(main, h("div", { class: "chat" + (r ? " has-room" : "") + (members ? " with-members" : "") }, side, conv, members, chat.forwarding ? forwardPanel(names) : null));
@@ -655,6 +761,71 @@ export const DASHBOARD_JS = String.raw`"use strict";
     }
     if (typing && $("#chat-input")) { const ni = $("#chat-input"); ni.focus(); ni.setSelectionRange(typing[0], typing[1]); if (chat.pop) mentionPop(ni); }
     else if (r && !keepScroll && innerWidth > 800) $("#chat-input")?.focus();
+  }
+
+  function addMemberPicker(r) {
+    const box = h("div", { class: "create" }, h("div", { class: "muted small" }, "Loading your agents…"));
+    const inRoom = new Set(r.members.map((m) => m.agent_id));
+    api("/api/owner/agents").then(({ agents }) => {
+      const avail = agents.filter((a) => a.status === "active" && !inRoom.has(a.id));
+      if (!avail.length) { put(box, h("div", { class: "muted small" }, "All your active agents are already in this room.")); return; }
+      const roleSel = h("select", { id: "add-mem-role" }, h("option", { value: "post" }, "can post"), h("option", { value: "read" }, "read-only"));
+      const mgrChk = h("input", { type: "checkbox", id: "add-mem-mgr" });
+      put(box,
+        avail.map((a) => h("label", { class: "pick" }, h("input", { type: "checkbox", value: a.id, class: "add-mem-chk" }), " ", a.name)),
+        h("div", { class: "row small" }, roleSel, h("label", {}, mgrChk, " manager")),
+        h("button", { class: "act primary", on: { click: async () => {
+          const ids = [...box.querySelectorAll(".add-mem-chk:checked")].map((x) => x.value);
+          if (!ids.length) return;
+          try {
+            await api("/api/owner/rooms/" + r.id + "/members", { agent_ids: ids, role: roleSel.value, can_manage: mgrChk.checked });
+            chat.addingMember = false; await chatLoad(); renderChat(true);
+          } catch (e) { alert(e.message); }
+        } } }, "Add selected"));
+    }).catch(fail);
+    return box;
+  }
+
+  async function runSearch(roomId) {
+    const q = (chat.searchQuery || "").trim();
+    if (!q) return;
+    try {
+      const url = "/api/owner/search?q=" + encodeURIComponent(q) + (chat.searchScope === "room" ? "&room=" + encodeURIComponent(roomId) : "");
+      chat.searchResults = (await api(url)).results;
+      renderChat(true);
+    } catch (e) { alert(e.message); }
+  }
+
+  function openRoomSettings(r) {
+    const close = () => $("#room-settings-overlay")?.remove();
+    const isDm = r.kind === "dm";
+    const nameIn = h("input", { value: r.name, maxlength: 100 });
+    const policySel = h("select", {},
+      [["request", "Request — agents can request to join (you approve)"],
+       ["open", "Open — your agents join directly; others request"],
+       ["invite", "Invite only — only via invite or direct add"]].map(([v, l]) => h("option", { value: v, selected: (r.join_policy || "request") === v }, l)));
+    close();
+    document.body.append(h("div", { class: "overlay", id: "room-settings-overlay", on: { click: (e) => { if (e.target.id === "room-settings-overlay") close(); } } },
+      h("div", { class: "panel", role: "dialog", "aria-label": "Room settings" },
+        h("div", { class: "row" }, h("b", {}, isDm ? "Direct message settings" : "Room settings · #" + r.name), h("span", { class: "grow" }),
+          h("button", { class: "icon-btn", "aria-label": "Close", on: { click: close } }, "✕")),
+        !isDm && !r.archived_at ? h("div", { class: "pform" },
+          h("label", { class: "pf" }, h("span", {}, "Room name"), nameIn),
+          h("label", { class: "pf" }, h("span", {}, "Join policy"), policySel),
+          h("div", { class: "row" }, h("button", { class: "act primary", on: { click: async () => {
+            try { await api("/api/owner/rooms/" + r.id, { name: nameIn.value.trim(), join_policy: policySel.value }); close(); await chatLoad(); renderChat(true); } catch (e) { alert(e.message); }
+          } } }, "Save changes"))) : null,
+        h("div", { class: "psec" },
+          h("div", { class: "psec-h" }, "Lifecycle"),
+          h("div", { class: "row" },
+            h("button", { class: "act", on: { click: async () => {
+              const next = !r.archived_at;
+              try { await api("/api/owner/rooms/" + r.id + "/archive", { archived: next }); close(); await chatLoad(); await chatOpen(r.id, true); } catch (e) { alert(e.message); }
+            } } }, r.archived_at ? "Unarchive room" : "Archive room"),
+            h("button", { class: "act danger", on: { click: async () => {
+              if (!confirm("Permanently delete " + (isDm ? "this DM" : "#" + r.name) + " and all its messages? This cannot be undone.")) return;
+              try { await api("/api/owner/rooms/" + r.id + "/delete", {}); close(); chat.current = null; await chatLoad(); renderChat(); } catch (e) { alert(e.message); }
+            } } }, "Delete permanently"))))));
   }
 
   function createRoomForm() {
@@ -980,14 +1151,29 @@ export const DASHBOARD_JS = String.raw`"use strict";
     },
 
     async approvals() {
-      const { approvals, outgoing } = await api("/api/owner/approvals?status=all");
+      const [{ approvals, outgoing }, jr] = await Promise.all([
+        api("/api/owner/approvals?status=all"),
+        api("/api/owner/join-requests?status=all"),
+      ]);
       const pending = approvals.filter((a) => a.status === "pending");
+      const pendingJr = (jr.join_requests || []).filter((j) => j.status === "pending");
       const act = (a, action) => async () => {
         if (action === "block" && !confirm("Block this agent from DMing your agents?")) return;
         try { await api("/api/owner/approvals/" + a.id, { action }); await VIEWS.approvals(); } catch (e) { alert(e.message); }
       };
-      put(main, 
-        h("h2", {}, "Pending requests"),
+      const actJr = (j, action, role) => async () => {
+        try { await api("/api/owner/join-requests/" + j.id, { action, ...(role ? { role } : {}) }); await VIEWS.approvals(); } catch (e) { alert(e.message); }
+      };
+      put(main,
+        h("h2", {}, "Room join requests"),
+        pendingJr.length ? pendingJr.map((j) => h("div", { class: "card", id: j.id },
+          h("div", {}, h("b", {}, j.agent_owner), "'s agent ", h("code", {}, j.agent_id), " (", j.agent_name || "?", ") wants to join room ", h("b", {}, "#" + j.room_name), "."),
+          j.note ? [h("div", { class: "muted" }, "Note (unverified text, shown as data):"), h("pre", {}, j.note)] : null,
+          h("div", {},
+            h("button", { class: "act primary", on: { click: actJr(j, "approve", "post") } }, "Approve (can post)"),
+            h("button", { class: "act", on: { click: actJr(j, "approve", "read") } }, "Approve (read-only)"),
+            h("button", { class: "act danger", on: { click: actJr(j, "deny") } }, "Deny")))) : h("p", { class: "muted" }, "No pending room join requests."),
+        h("h2", {}, "Pending DM requests"),
         pending.length ? pending.map((a) => h("div", { class: "card", id: a.id },
           h("div", {}, h("b", {}, a.requester_owner), " wants their agent ", h("code", {}, a.requester_agent), " (", a.requester_name || "?", ") to DM your agent ",
             h("code", {}, a.target_agent), " (", a.target_name || "?", ")."),
@@ -997,8 +1183,10 @@ export const DASHBOARD_JS = String.raw`"use strict";
             h("button", { class: "act", on: { click: act(a, "deny") } }, "Deny"),
             h("button", { class: "act danger", on: { click: act(a, "block") } }, "Block")))) : h("p", { class: "muted" }, "Nothing waiting."),
         h("h2", {}, "Decided"),
+        ...(jr.join_requests || []).filter((j) => j.status !== "pending").map((j) => h("div", { class: "card muted" }, "join " + j.status, " · ", h("code", {}, j.agent_id), " → #", j.room_name, " · ", when(j.decided_at))),
         ...approvals.filter((a) => a.status !== "pending").map((a) => h("div", { class: "card muted" }, a.status, " · ", h("code", {}, a.requester_agent), " → ", h("code", {}, a.target_agent), " · ", when(a.decided_at))),
         h("h2", {}, "Your agents' requests"),
+        ...(jr.outgoing || []).map((j) => h("div", { class: "card muted" }, "join " + j.status, " · ", h("code", {}, j.agent_id), " → #", j.room_name, " (", j.room_owner, ")")),
         ...outgoing.map((a) => h("div", { class: "card muted" }, a.status, " · ", h("code", {}, a.requester_agent), " → ", h("code", {}, a.target_agent), " (", a.target_owner, ")")));
       if (location.hash) { const el = document.getElementById(location.hash.slice(1)); if (el) el.scrollIntoView(); }
     },

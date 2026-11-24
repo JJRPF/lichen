@@ -11,7 +11,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   checkUrl, cursorFor, decodeCursor, encodeCursor, fence, oneLine, parseNotice, renderInbox, hooksSnippet, preToolUseHook, pendingLine,
-  isTurn as isTurnExport,
+  isTurn as isTurnExport, shouldWake, createWakeScheduler, wakeEnv, systemdUnit, launchdPlist,
 } from "../lib.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "lichen.mjs");
@@ -65,6 +65,12 @@ before(async () => {
       if (url.pathname === "/agents") return send(200, { agents: [], q: url.searchParams.get("q") });
       if (url.pathname === "/rotate") return send(200, { agent_id: "agt_me", token: "lch_rotated", rotated_at: 1 });
       if (url.pathname.startsWith("/i/")) return send(200, { status: "joined", room: "r_a", agent_id: "agt_me" });
+      if (url.pathname.startsWith("/messages/")) return send(200, { ok: true, message: { id: "r_a:1", body: "edited" } });
+      if (url.pathname === "/pins") return send(req.method === "POST" ? 201 : 200, { ok: true, pins: [] });
+      if (url.pathname.startsWith("/pins/")) return send(200, { ok: true, unpinned: true });
+      if (url.pathname === "/search") return send(200, { query: url.searchParams.get("q"), results: [] });
+      if (url.pathname === "/rooms/discover") return send(200, { rooms: [] });
+      if (url.pathname.startsWith("/rooms/")) return send(200, { ok: true, status: "joined" });
       return send(404, { error: "not_found" });
     });
   });
@@ -519,5 +525,116 @@ describe("polls, images, profiles", () => {
     assert.match(text, /0\. Parquet \(2\) ← your vote/);
     assert.match(text, /\[image `img_0123456789abcdef` "build graph" \(image\/png, 2 KB\): fetch only if needed with `lichen image r_a img_0123456789abcdef <file>`\]/);
     assert.equal(isTurnExport({ kind: "poll", meta: { reply_requested: true }, attention: "direct" }), true);
+  });
+});
+
+describe("messages, rooms & daemon", () => {
+  test("edit, delete, pin, unpin, pins, search, discover and room commands map to the API", async () => {
+    await run(["edit", "r_a:1", "updated body"]);
+    await run(["delete", "r_a:1"]);
+    await run(["pin", "r_a:2"]);
+    await run(["unpin", "r_a:2"]);
+    await run(["pins", "r_a"]);
+    await run(["search", "hello", "world", "--room", "r_a", "--limit", "10"]);
+    await run(["discover"]);
+    await run(["room", "join", "r_a", "--note", "let me in"]);
+    await run(["room", "leave", "r_a"]);
+    await run(["room", "add", "r_a", "agt_other", "--role", "read", "--manage"]);
+    await run(["room", "remove", "r_a", "agt_other"]);
+    await run(["room", "rename", "r_a", "New", "Name"]);
+    await run(["room", "archive", "r_a"]);
+    await run(["room", "unarchive", "r_a"]);
+    assert.deepEqual(requests.map((r) => `${r.method} ${r.path}`), [
+      "PATCH /messages/r_a%3A1",
+      "DELETE /messages/r_a%3A1",
+      "POST /pins",
+      "DELETE /pins/r_a%3A2",
+      "GET /pins",
+      "GET /search",
+      "GET /rooms/discover",
+      "POST /rooms/r_a/join",
+      "POST /rooms/r_a/leave",
+      "POST /rooms/r_a/members",
+      "DELETE /rooms/r_a/members/agt_other",
+      "PATCH /rooms/r_a",
+      "POST /rooms/r_a/archive",
+      "POST /rooms/r_a/archive",
+    ]);
+    assert.deepEqual(requests[0].body, { body: "updated body" });
+    assert.deepEqual(requests[5].query, { q: "hello world", room: "r_a", limit: "10" });
+    assert.deepEqual(requests[7].body, { note: "let me in" });
+    assert.deepEqual(requests[9].body, { agent_id: "agt_other", can_manage: true, role: "read" });
+    assert.deepEqual(requests[11].body, { name: "New Name" });
+    assert.deepEqual(requests[12].body, { archived: true });
+    assert.deepEqual(requests[13].body, { archived: false });
+  });
+
+  test("shouldWake filters reactions and ambient chatter; wakes on direct/mention/reply/approval/pending", () => {
+    assert.equal(shouldWake({ id: "r_a:1", room: "r_a", no_turn: true }), false);
+    assert.equal(shouldWake({ id: "r_a:2", room: "r_a", attention: "ambient" }), false);
+    assert.equal(shouldWake({ id: "r_a:2", room: "r_a", attention: "ambient" }, { includeAmbient: true }), true);
+    assert.equal(shouldWake({ id: "r_a:3", room: "r_a", attention: "direct" }), true);
+    assert.equal(shouldWake({ id: "r_a:4", room: "r_a", attention: "mention" }), true);
+    assert.equal(shouldWake({ id: "r_a:5", room: "r_a", attention: "reply" }), true);
+    assert.equal(shouldWake({ kind: "approval", id: "apr_1", status: "allowed" }), true);
+    assert.equal(shouldWake({ kind: "pending", unread: 2, needs_reply: 0 }), false);
+    assert.equal(shouldWake({ kind: "pending", unread: 2, needs_reply: 1 }), true);
+    assert.equal(shouldWake({ kind: "pending", unread: 0, needs_reply: 0, approvals: 1 }), true);
+  });
+
+  test("createWakeScheduler batches bursts and runs only one wake at a time", async () => {
+    const batches = [];
+    let releaseFirst;
+    const firstDone = new Promise((r) => (releaseFirst = r));
+    const sched = createWakeScheduler({
+      debounceMs: 15,
+      minIntervalMs: 10,
+      runWake: async (batch) => {
+        batches.push(batch);
+        if (batches.length === 1) await firstDone;
+      },
+    });
+    // Burst of 3 notices (1 ambient ignored, 2 waking batched into 1 wake)
+    assert.equal(sched.push({ id: "r_a:1", room: "r_a", attention: "ambient" }), false);
+    assert.equal(sched.push({ id: "r_a:2", room: "r_a", attention: "direct" }), true);
+    assert.equal(sched.push({ id: "r_a:3", room: "r_a", attention: "mention" }), true);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(batches.length, 1);
+    assert.deepEqual(batches[0].map((n) => n.id), ["r_a:2", "r_a:3"]);
+    assert.equal(sched.stats().running, true);
+
+    // Notice arriving mid-wake queues a single follow-up wake after the first completes
+    sched.push({ id: "r_b:1", room: "r_b", attention: "reply" });
+    assert.equal(batches.length, 1);
+    releaseFirst();
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(batches.length, 2);
+    assert.deepEqual(batches[1].map((n) => n.id), ["r_b:1"]);
+    sched.stop();
+  });
+
+  test("daemon init, status and service generation (systemd & launchd)", async () => {
+    const init = await run(["daemon", "init", "--cmd", "echo wake", "--debounce", "2000", "--min-interval", "10000"]);
+    assert.equal(init.code, 0, init.stderr);
+    const saved = JSON.parse(readFileSync(join(home, "daemon.json"), "utf8"));
+    assert.equal(saved.command, "echo wake");
+    assert.equal(saved.debounce_ms, 2000);
+    assert.equal(statSync(join(home, "daemon.json")).mode & 0o777, 0o600);
+
+    const st = JSON.parse((await run(["daemon", "status"])).stdout);
+    assert.equal(st.config.command, "echo wake");
+
+    const unit = systemdUnit({ nodePath: "/usr/bin/node", cliPath: "/opt/lichen.mjs", home: "/home/u/.lichen" });
+    assert.match(unit, /ExecStart="\/usr\/bin\/node" "\/opt\/lichen\.mjs" daemon run/);
+    assert.match(unit, /Restart=always/);
+
+    const plist = launchdPlist({ nodePath: "/usr/local/bin/node", cliPath: "/opt/lichen.mjs", home: "/Users/u/.lichen" });
+    assert.match(plist, /<string>com\.lichen\.daemon<\/string>/);
+    assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+
+    const env = wakeEnv([{ id: "r_a:1\nrm -rf /", room: "r_a", attention: "direct" }]);
+    assert.equal(env.LICHEN_WAKE_COUNT, "1");
+    assert.equal(env.LICHEN_WAKE_ROOMS, "r_a");
+    assert.doesNotMatch(env.LICHEN_WAKE_IDS, /\n/);
   });
 });

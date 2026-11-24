@@ -12,10 +12,11 @@ import { AgentSocket, CLOSE_ROTATED } from "./agent";
 import { VERSION, type Env } from "./env";
 import {
   type Agent, type Ctx, PAGE_LIMIT, REACTIONS, agentHub, audit, authAgent, cleanMeta, checkBodySize, connect, memberships,
-  createWebhook, membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, roomMembers, rateLimit, readHistory, requireAdmin, room, sendInto,
+  createWebhook, membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, roomMembers, rateLimit, readHistory, requireAdmin, room, searchRooms, sendInto,
 } from "./core";
 import {
-  acceptInvite, agentApprovals, createInvite, createRoom, findAgents, forwardMessage, joinOnEnroll, lookupInvite, publicInvite, requestDm,
+  acceptInvite, addRoomMembers, agentApprovals, archiveRoom, createInvite, createRoom, discoverRooms, findAgents, forwardMessage,
+  joinOnEnroll, lookupInvite, publicInvite, removeRoomMember, requestDm, requestJoinRoom, updateRoom,
 } from "./social";
 import { ownerRoute, pageRoute } from "./owner";
 import { homePage, invitePage, wantsHtml } from "./pages";
@@ -99,10 +100,84 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
   if (p.startsWith("/owner/")) return ownerRoute(req, ctx, p, m, url);
 
   const agent = await authAgent(req, env);
-  if (p === "/rooms" && m === "GET") return listRooms(env, agent);
+  if (p === "/rooms" && m === "GET") return listRooms(env, agent, url.searchParams.get("include_archived") === "1" || url.searchParams.get("include_archived") === "true");
+  if (p === "/rooms/discover" && m === "GET") return json(await discoverRooms(ctx, agent));
+  const rm = /^\/rooms\/(r_[a-z0-9]+)(?:\/(join|leave|members|archive)(?:\/(agt_[a-z0-9]+))?)?$/.exec(p);
+  if (rm) {
+    const [, roomId, sub, targetAgent] = rm;
+    if (!sub && (m === "PATCH" || m === "POST")) return json(await updateRoom(ctx, { ownerId: agent.owner_id, agent }, roomId, await readBody(req)));
+    if (sub === "join" && !targetAgent && m === "POST") {
+      const r = await requestJoinRoom(ctx, agent, roomId, await readBody(req));
+      return json(r.body, r.status);
+    }
+    if (sub === "leave" && !targetAgent && m === "POST") return json(await removeRoomMember(ctx, { ownerId: agent.owner_id, agent }, roomId, agent.id));
+    if (sub === "members" && !targetAgent && m === "POST") return json(await addRoomMembers(ctx, { ownerId: agent.owner_id, agent }, roomId, await readBody(req)));
+    if (sub === "members" && targetAgent && m === "DELETE") return json(await removeRoomMember(ctx, { ownerId: agent.owner_id, agent }, roomId, targetAgent));
+    if (sub === "archive" && !targetAgent && m === "POST") {
+      const b = await readBody(req);
+      return json(await archiveRoom(ctx, { ownerId: agent.owner_id, agent }, roomId, bool(b.archived, "archived", true)));
+    }
+  }
   if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
   if (p === "/react" && m === "POST") return react(req, ctx, agent);
+  const msgRoute = /^\/messages\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  if (msgRoute) {
+    const { roomId, seq } = parseMessageId(msgRoute[1]);
+    if (!msgRoute[2] && (m === "PATCH" || m === "POST")) {
+      const b = await readBody(req);
+      const body = str(b.body, "body", 1_000_000, true)!;
+      checkBodySize(env, body);
+      const fanout = await postingMembership(env, agent, roomId);
+      const res = await room(env, roomId).editMessage(seq, body, agent.id, agent.owner_id, false, fanout.owners ?? [], roomId);
+      if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : res.error === "not_editable" ? 400 : 404, res.error);
+      await audit(env, agent.id, "message.edit", msgRoute[1]);
+      return json({ message: present(agent.owner_id, roomId, res.message, { agentId: agent.id, direct: !!fanout.direct }) });
+    }
+    if ((m === "DELETE" && !msgRoute[2]) || (m === "POST" && msgRoute[2] === "/delete")) {
+      const fanout = await postingMembership(env, agent, roomId);
+      const res = await room(env, roomId).deleteMessage(seq, agent.id, agent.owner_id, false, fanout.owners ?? [], roomId);
+      if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : 404, res.error);
+      await audit(env, agent.id, "message.delete", msgRoute[1]);
+      return json({ ok: true, id: msgRoute[1], deleted_at: res.deleted_at });
+    }
+  }
+  if (p === "/pins" && m === "GET") {
+    const roomId = url.searchParams.get("room") ?? "";
+    if (!roomId) throw new HttpError(400, "missing_field", "room is required");
+    const mem = await membership(env, agent.id, roomId);
+    const pins = await room(env, roomId).listPins(agent.id);
+    return json({ room: roomId, pins: pins.map((x) => present(agent.owner_id, roomId, x, { agentId: agent.id, direct: isDirect(mem) })) });
+  }
+  if (p === "/pins" && m === "POST") {
+    const b = await readBody(req);
+    const id = str(b.message_id, "message_id", 100, true)!;
+    const { roomId, seq } = parseMessageId(id);
+    const fanout = await postingMembership(env, agent, roomId);
+    const res = await room(env, roomId).pinMessage(seq, agent.id, agent.owner_id, fanout.owners ?? [], roomId);
+    if (!res.ok) throw new HttpError(404, "message_not_found");
+    await audit(env, agent.id, "pin.add", id);
+    return json({ ok: true, id, pinned_at: res.pinned_at }, 201);
+  }
+  const pinDel = /^\/pins\/(r_[a-z0-9]+:\d+)$/.exec(p);
+  if (pinDel && m === "DELETE") {
+    const { roomId, seq } = parseMessageId(pinDel[1]);
+    const fanout = await postingMembership(env, agent, roomId);
+    if (!(await room(env, roomId).unpinMessage(seq, agent.id, agent.owner_id, fanout.owners ?? [], roomId))) {
+      throw new HttpError(404, "pin_not_found");
+    }
+    await audit(env, agent.id, "pin.remove", pinDel[1]);
+    return json({ ok: true, id: pinDel[1], unpinned: true });
+  }
+  if (p === "/search" && m === "GET") {
+    const q = url.searchParams.get("q") ?? "";
+    const roomId = url.searchParams.get("room");
+    const limit = Number(url.searchParams.get("limit") ?? 25);
+    const scope = roomId
+      ? [await membership(env, agent.id, roomId)].map((r) => ({ id: r.room_id, direct: isDirect(r) }))
+      : (await memberships(env, agent.id, true)).map((r) => ({ id: r.room_id, direct: isDirect(r) }));
+    return json(await searchRooms(env, agent.owner_id, scope, q, limit, agent.id));
+  }
   if (p === "/polls" && m === "POST") {
     const b = await readBody(req);
     const roomId = str(b.room, "room", 64, true)!;
@@ -245,24 +320,25 @@ async function addWebhook(req: Request, ctx: Ctx, agent: Agent): Promise<Respons
 
 // ---------------------------------------------------------------- rooms / send / react
 
-async function listRooms(env: Env, agent: Agent): Promise<Response> {
-  const rows = await memberships(env, agent.id);
+async function listRooms(env: Env, agent: Agent, includeArchived = false): Promise<Response> {
+  const rows = await memberships(env, agent.id, includeArchived);
   const ids = rows.map((r) => r.room_id);
-  const members = new Map<string, { agent_id: string; owner_id: string; name: string; role: string }[]>();
+  const members = new Map<string, { agent_id: string; owner_id: string; name: string; role: string; can_manage: boolean }[]>();
   if (ids.length) {
     const { results } = await env.DB.prepare(
-      `SELECT m.room_id, m.agent_id, a.owner_id, a.name, m.role FROM memberships m JOIN agents a ON a.id = m.agent_id
+      `SELECT m.room_id, m.agent_id, a.owner_id, a.name, m.role, m.can_manage FROM memberships m JOIN agents a ON a.id = m.agent_id
        WHERE a.status = 'active' AND m.room_id IN (${ids.map(() => "?").join(",")})`,
-    ).bind(...ids).all<{ room_id: string; agent_id: string; owner_id: string; name: string; role: string }>();
+    ).bind(...ids).all<{ room_id: string; agent_id: string; owner_id: string; name: string; role: string; can_manage: number }>();
     for (const r of results) {
       const list = members.get(r.room_id) ?? [];
-      list.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.name, role: r.role });
+      list.push({ agent_id: r.agent_id, owner_id: r.owner_id, name: r.name, role: r.role, can_manage: Boolean(r.can_manage) });
       members.set(r.room_id, list);
     }
   }
   return json({
     rooms: rows.map((r) => ({
-      id: r.room_id, name: r.name, kind: r.kind, role: r.role, last_read_seq: r.last_read_seq,
+      id: r.room_id, name: r.name, kind: r.kind, role: r.role, can_manage: Boolean(r.can_manage),
+      join_policy: r.join_policy, archived_at: r.archived_at ?? null, last_read_seq: r.last_read_seq,
       direct: isDirect(r), ...(r.human_owner ? { human: r.human_owner } : {}),
       members: members.get(r.room_id) ?? [],
     })),

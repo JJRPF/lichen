@@ -78,20 +78,21 @@ export const agentHub = (env: Env, agentId: string) => env.AGENT.get(env.AGENT.i
 export const ownerHub = (env: Env, ownerId: string) => env.AGENT.get(env.AGENT.idFromName(ownerHubName(ownerId)));
 
 export interface MembershipRow {
-  room_id: string; name: string; kind: string; role: string; last_read_seq: number;
-  human_owner: string | null; members: number;
+  room_id: string; name: string; kind: string; role: string; can_manage: number; last_read_seq: number;
+  human_owner: string | null; archived_at: number | null; join_policy: string; members: number;
 }
 
-const MEMBERSHIP_COLS = `m.room_id, r.name, r.kind, m.role, m.last_read_seq, r.human_owner,
+const MEMBERSHIP_COLS = `m.room_id, r.name, r.kind, m.role, m.can_manage, m.last_read_seq, r.human_owner, r.archived_at, r.join_policy,
   (SELECT COUNT(*) FROM memberships x JOIN agents ax ON ax.id = x.agent_id WHERE x.room_id = m.room_id AND ax.status = 'active') AS members`;
 
 /** Every message in a DM, a human↔agent DM, or a two-member room is "direct". */
 export const isDirect = (r: { kind: string; human_owner: string | null; members: number }) =>
   r.kind === "dm" || !!r.human_owner || r.members <= 2;
 
-export async function memberships(env: Env, agentId: string): Promise<MembershipRow[]> {
+export async function memberships(env: Env, agentId: string, includeArchived = false): Promise<MembershipRow[]> {
   const { results } = await env.DB.prepare(
-    `SELECT ${MEMBERSHIP_COLS} FROM memberships m JOIN rooms r ON r.id = m.room_id WHERE m.agent_id = ? ORDER BY r.created_at`,
+    `SELECT ${MEMBERSHIP_COLS} FROM memberships m JOIN rooms r ON r.id = m.room_id
+     WHERE m.agent_id = ? ${includeArchived ? "" : "AND r.archived_at IS NULL"} ORDER BY r.created_at`,
   ).bind(agentId).all<MembershipRow>();
   return results;
 }
@@ -105,12 +106,15 @@ export async function membership(env: Env, agentId: string, roomId: string): Pro
   return row;
 }
 
-export interface MemberRow { agent_id: string; owner_id: string; name: string; role: string; kind: string; human_owner: string | null }
+export interface MemberRow {
+  agent_id: string; owner_id: string; name: string; role: string; can_manage: number;
+  kind: string; human_owner: string | null; archived_at: number | null;
+}
 
 /** Active members of a room, with the room's kind (one D1 query). */
 export async function roomMembers(env: Env, roomId: string): Promise<MemberRow[]> {
   const { results } = await env.DB.prepare(
-    `SELECT m.agent_id, a.owner_id, a.name, m.role, r.kind, r.human_owner
+    `SELECT m.agent_id, a.owner_id, a.name, m.role, m.can_manage, r.kind, r.human_owner, r.archived_at
      FROM memberships m JOIN agents a ON a.id = m.agent_id JOIN rooms r ON r.id = m.room_id
      WHERE m.room_id = ? AND a.status = 'active'`,
   ).bind(roomId).all<MemberRow>();
@@ -139,6 +143,7 @@ export async function postingMembership(env: Env, sender: Agent, roomId: string)
   const rows = await roomMembers(env, roomId);
   const me = rows.find((r) => r.agent_id === sender.id);
   if (!me) throw new HttpError(404, "room_not_found");
+  if (me.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
   if (me.role !== "post") throw new HttpError(403, "read_only", "This agent can only read this room");
   return fanoutFor(roomId, rows, sender.id);
 }
@@ -241,8 +246,21 @@ export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: st
  */
 export async function ownerFanout(env: Env, ownerId: string, roomId: string): Promise<RoomFanout> {
   const rows = await roomMembers(env, roomId);
-  if (!rows.some((r) => r.owner_id === ownerId)) throw new HttpError(404, "room_not_found");
-  return fanoutFor(roomId, rows, null);
+  if (rows.length) {
+    if (!rows.some((r) => r.owner_id === ownerId)) {
+      const created = await env.DB.prepare("SELECT archived_at FROM rooms WHERE id = ? AND created_by = ?").bind(roomId, ownerId).first<{ archived_at: number | null }>();
+      if (!created) throw new HttpError(404, "room_not_found");
+      if (created.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
+    } else if (rows[0].archived_at) {
+      throw new HttpError(409, "room_archived", "This room is archived");
+    }
+    return fanoutFor(roomId, rows, null);
+  }
+  const r = await env.DB.prepare("SELECT kind, human_owner, archived_at FROM rooms WHERE id = ? AND created_by = ?")
+    .bind(roomId, ownerId).first<{ kind: string; human_owner: string | null; archived_at: number | null }>();
+  if (!r) throw new HttpError(404, "room_not_found");
+  if (r.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
+  return { roomId, recipients: [], owners: [ownerId], direct: isDirect({ kind: r.kind, human_owner: r.human_owner, members: 0 }), members: [] };
 }
 
 /** The room DO only needs who to notify, not member names. */
@@ -269,12 +287,41 @@ export function present(viewerOwner: string, roomId: string, m: StoredMessage, v
   // Owners post as themselves (github:<user>) from the dashboard; agents as agt_….
   const sender_kind = m.sender_id.startsWith("github:") ? "human" : "agent";
   const envelope = { sender_id: m.sender_id, sender_owner_id: m.sender_owner_id, sender_kind, trust_tier };
-  const base = { id: `${roomId}:${m.seq}`, room: roomId, seq: m.seq, kind: m.kind, envelope, created_at: m.created_at };
+  const base = {
+    id: `${roomId}:${m.seq}`, room: roomId, seq: m.seq, kind: m.kind, envelope, created_at: m.created_at,
+    ...(m.edited_at ? { edited_at: m.edited_at } : {}),
+    ...(m.deleted_at ? { deleted: true, deleted_at: m.deleted_at, deleted_by: m.deleted_by ?? null } : {}),
+    ...(m.pinned_at ? { pinned_at: m.pinned_at, pinned_by: m.pinned_by ?? null } : {}),
+  };
   if (m.kind === "reaction") {
     return { ...base, emoji: m.emoji, target_id: `${roomId}:${m.target_seq}`, no_turn: true };
   }
   const attention = viewer && m.sender_id !== viewer.agentId ? attentionFor(viewer.agentId, viewer.direct, m.meta) : undefined;
-  return { ...base, body: m.body, meta: m.meta, ...(m.poll ? { poll: m.poll } : {}), no_turn: false, ...(attention ? { attention } : {}) };
+  return {
+    ...base,
+    body: m.deleted_at ? null : m.body,
+    meta: m.deleted_at ? null : m.meta,
+    ...(m.poll && !m.deleted_at ? { poll: m.poll } : {}),
+    no_turn: Boolean(m.deleted_at),
+    ...(attention ? { attention } : {}),
+  };
+}
+
+export async function searchRooms(
+  env: Env, viewerOwner: string, rooms: { id: string; direct?: boolean }[], query: string, limit: number, agentId?: string,
+) {
+  const q = query.trim();
+  if (!q) throw new HttpError(400, "missing_field", "q is required");
+  if (q.length > 200) throw new HttpError(400, "field_too_long", "q must be at most 200 characters");
+  const cap = Math.min(Math.max(limit || 25, 1), 50);
+  const voterId = agentId ?? viewerOwner;
+  const perRoom = await Promise.all(rooms.map(async (r) => {
+    const msgs = await room(env, r.id).search(q, cap, voterId);
+    const viewer = agentId ? { agentId, direct: !!r.direct } : undefined;
+    return msgs.map((m) => present(viewerOwner, r.id, m, viewer));
+  }));
+  const results = perRoom.flat().sort((a, b) => b.created_at - a.created_at).slice(0, cap);
+  return { query: q, results };
 }
 
 export async function readHistory(env: Env, viewerOwner: string, roomId: string, url: URL, viewer?: { agentId: string; direct: boolean }) {
@@ -300,6 +347,7 @@ export const newNtfyTopic = () => `lichen-${randomString(24)}`;
 
 const NOTICE_TEXT: Record<string, string> = {
   approval_pending: "Lichen: 1 pending request",
+  join_request_pending: "Lichen: 1 room join request",
   invite_joined: "Lichen: someone joined",
   thread_paused: "Lichen: a thread is paused",
 };
@@ -330,18 +378,25 @@ export async function ownerNotice(ctx: Ctx, ownerId: string, kind: string, targe
   }).catch(() => undefined));
 }
 
-/** Rooms (and their members) that any of this owner's agents belong to. */
-export async function ownerRoomIds(env: Env, ownerId: string): Promise<string[]> {
+/** Rooms that any of this owner's agents belong to, or that this owner created. */
+export async function ownerRoomIds(env: Env, ownerId: string, includeArchived = false): Promise<string[]> {
+  const arch = includeArchived ? "" : "AND r.archived_at IS NULL";
   const { results } = await env.DB.prepare(
-    `SELECT DISTINCT m.room_id FROM memberships m JOIN agents a ON a.id = m.agent_id WHERE a.owner_id = ?`,
-  ).bind(ownerId).all<{ room_id: string }>();
+    `SELECT DISTINCT r.id AS room_id FROM rooms r
+     LEFT JOIN memberships m ON m.room_id = r.id
+     LEFT JOIN agents a ON a.id = m.agent_id
+     WHERE (a.owner_id = ? OR r.created_by = ?) ${arch}`,
+  ).bind(ownerId, ownerId).all<{ room_id: string }>();
   return results.map((r) => r.room_id);
 }
 
 export async function ownerCanSeeRoom(env: Env, ownerId: string, roomId: string): Promise<boolean> {
   const row = await env.DB.prepare(
-    `SELECT 1 AS ok FROM memberships m JOIN agents a ON a.id = m.agent_id WHERE m.room_id = ? AND a.owner_id = ? LIMIT 1`,
-  ).bind(roomId, ownerId).first();
+    `SELECT 1 AS ok FROM rooms r
+     LEFT JOIN memberships m ON m.room_id = r.id
+     LEFT JOIN agents a ON a.id = m.agent_id
+     WHERE r.id = ? AND (a.owner_id = ? OR r.created_by = ?) LIMIT 1`,
+  ).bind(roomId, ownerId, ownerId).first();
   return Boolean(row);
 }
 

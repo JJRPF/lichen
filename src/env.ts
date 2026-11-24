@@ -6,7 +6,7 @@
 import type { Room, MessageMeta } from "./room";
 import type { AgentSocket } from "./agent";
 
-export const VERSION = "0.10.0";
+export const VERSION = "0.11.0";
 
 export interface Env {
   DB: D1Database;
