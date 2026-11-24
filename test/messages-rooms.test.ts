@@ -189,4 +189,31 @@ describe("rooms: rename, archive, delete, membership & self-join", () => {
     // 6. Stranger frank cannot see or request erin's room
     expect((await call(`/rooms/${rReq}/join`, { token: f1.token, body: {} })).status).toBe(404);
   });
+
+  it("lets owners manage/delete admin-created rooms and toggle thread auto-pause off", async () => {
+    await registerOwner("github:grace", "grace@example.com");
+    const g1 = await newAgent("github:grace", "g1");
+    // Room created via /admin/rooms (created_by = 'admin')
+    const adminRoomId = await newRoom([g1.agent_id], "pilot");
+
+    const listed = await ownerCall("/owner/rooms", { as: "github:grace" });
+    const found = listed.data.rooms.find((r: any) => r.id === adminRoomId);
+    expect(found.can_manage).toBe(true);
+    expect(found.auto_pause).toBe(true);
+
+    // Disable thread freezing (auto_pause: false)
+    const upd = await ownerCall(`/owner/rooms/${adminRoomId}`, { as: "github:grace", method: "PATCH", body: { auto_pause: false } });
+    expect(upd.status).toBe(200);
+    expect(upd.data.auto_pause).toBe(false);
+
+    // Send 12 consecutive agent messages without hitting the turn cap (default 10)
+    for (let i = 0; i < 12; i++) {
+      const s = await call("/send", { token: g1.token, body: { room: adminRoomId, body: `msg ${i}` } });
+      expect(s.status).toBe(201);
+      expect(s.data.thread_paused).toBe(false);
+    }
+
+    // Owner can delete the admin-created room
+    expect((await ownerCall(`/owner/rooms/${adminRoomId}`, { as: "github:grace", method: "DELETE" })).status).toBe(200);
+  });
 });

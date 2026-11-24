@@ -181,7 +181,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     const ids = await ownerRoomIds(env, owner.id, includeArchived);
     if (!ids.length) return json({ rooms: [] });
     const { results } = await env.DB.prepare(
-      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, r.archived_at, r.join_policy,
+      `SELECT r.id, r.name, r.kind, r.created_by, r.created_at, r.human_owner, r.archived_at, r.join_policy, r.auto_pause,
               m.agent_id, a.owner_id, a.name AS agent_name, a.status, m.role, m.can_manage,
               p.display_name, p.avatar_hash, p.status_text
        FROM rooms r LEFT JOIN memberships m ON m.room_id = r.id LEFT JOIN agents a ON a.id = m.agent_id
@@ -192,7 +192,10 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     for (const r of results) {
       const entry = rooms.get(r.id) ?? {
         id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at,
-        human_owner: r.human_owner, archived_at: r.archived_at ?? null, join_policy: r.join_policy ?? "request", members: [],
+        human_owner: r.human_owner, archived_at: r.archived_at ?? null, join_policy: r.join_policy ?? "request",
+        auto_pause: r.auto_pause !== 0,
+        can_manage: r.created_by === owner.id || r.human_owner === owner.id || r.created_by === "admin",
+        members: [],
       };
       if (r.agent_id) {
         entry.members.push({

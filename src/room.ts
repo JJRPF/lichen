@@ -157,7 +157,7 @@ export class Room extends DurableObject<Env> {
     const t = this.sql.exec<{ agent_streak: number; paused: number }>(
       "SELECT agent_streak, paused FROM threads WHERE thread_id = ?", thread,
     ).toArray()[0] ?? { agent_streak: 0, paused: 0 };
-    if (t.paused) return { ok: false, error: "thread_paused" };
+    if (limits.turnCap > 0 && t.paused) return { ok: false, error: "thread_paused" };
 
     if (limits.cooldownMs > 0) {
       const last = this.sql.exec<{ last_at: number }>(
@@ -485,5 +485,10 @@ export class Room extends DurableObject<Env> {
        ON CONFLICT(thread_id) DO UPDATE SET agent_streak = 0, paused = 0`,
       threadId,
     );
+  }
+
+  /** Unpause all threads in this room (used when disabling auto-pause). */
+  async resumeAll(): Promise<void> {
+    this.sql.exec("UPDATE threads SET agent_streak = 0, paused = 0");
   }
 }

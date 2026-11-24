@@ -510,38 +510,48 @@ const JOIN_POLICIES = new Set(["invite", "request", "open"]);
 
 interface RoomRow {
   id: string; name: string; kind: string; created_by: string; human_owner: string | null;
-  archived_at: number | null; join_policy: string;
+  archived_at: number | null; join_policy: string; auto_pause: number;
 }
 
 async function getRoomRow(env: Env, roomId: string): Promise<RoomRow> {
   const r = await env.DB.prepare(
-    "SELECT id, name, kind, created_by, human_owner, archived_at, join_policy FROM rooms WHERE id = ?",
+    "SELECT id, name, kind, created_by, human_owner, archived_at, join_policy, auto_pause FROM rooms WHERE id = ?",
   ).bind(roomId).first<RoomRow>();
   if (!r) throw new HttpError(404, "room_not_found");
   return r;
 }
 
-/** Rename a room or update its join_policy. Owner creator, or an authorized agent (can_manage). */
+/** An owner can manage a room if they created it, it's their human DM, or it's an admin-created room they belong to. */
+async function canOwnerManageRoom(env: Env, ownerId: string, r: RoomRow): Promise<boolean> {
+  if (r.created_by === ownerId || r.human_owner === ownerId) return true;
+  if (r.created_by === "admin") return ownerCanSeeRoom(env, ownerId, r.id);
+  return false;
+}
+
+/** Rename a room or update its join_policy / auto_pause. Owner creator (or admin-room member), or an authorized agent (can_manage). */
 export async function updateRoom(ctx: Ctx, by: { ownerId: string; agent?: Agent }, roomId: string, b: Record<string, unknown>) {
   const { env } = ctx;
   const r = await getRoomRow(env, roomId);
   if (by.agent) {
     const m = await membership(env, by.agent.id, roomId);
     if (!m.can_manage) throw new HttpError(403, "forbidden", "This agent is not authorized to manage this room");
-  } else if (r.created_by !== by.ownerId) {
+  } else if (!(await canOwnerManageRoom(env, by.ownerId, r))) {
     throw new HttpError(403, "forbidden", "Only the room's creator can edit room settings");
   }
-  if (r.kind !== "room") throw new HttpError(400, "invalid_room", "Direct messages cannot be renamed or change join policy");
+  if (r.kind !== "room") throw new HttpError(400, "invalid_room", "Direct messages cannot be renamed or change room settings");
   if (r.archived_at) throw new HttpError(409, "room_archived", "Unarchive the room before editing it");
 
   const nextName = b.name !== undefined ? str(b.name, "name", 100, true)!.trim() : r.name;
   if (!nextName) throw new HttpError(400, "missing_field", "name cannot be empty");
   const nextPolicy = b.join_policy !== undefined ? str(b.join_policy, "join_policy", 16, true)! : r.join_policy;
   if (!JOIN_POLICIES.has(nextPolicy)) throw new HttpError(400, "invalid_field", "join_policy must be invite, request or open");
+  const nextAutoPause = b.auto_pause !== undefined ? bool(b.auto_pause, "auto_pause", true) : r.auto_pause !== 0;
 
-  await env.DB.prepare("UPDATE rooms SET name = ?, join_policy = ? WHERE id = ?").bind(nextName, nextPolicy, roomId).run();
-  await audit(env, by.agent?.id ?? by.ownerId, "room.update", roomId, { name: nextName, join_policy: nextPolicy });
-  return { id: roomId, name: nextName, join_policy: nextPolicy };
+  await env.DB.prepare("UPDATE rooms SET name = ?, join_policy = ?, auto_pause = ? WHERE id = ?")
+    .bind(nextName, nextPolicy, nextAutoPause ? 1 : 0, roomId).run();
+  if (!nextAutoPause) await room(env, roomId).resumeAll();
+  await audit(env, by.agent?.id ?? by.ownerId, "room.update", roomId, { name: nextName, join_policy: nextPolicy, auto_pause: nextAutoPause });
+  return { id: roomId, name: nextName, join_policy: nextPolicy, auto_pause: nextAutoPause };
 }
 
 /** Archive or unarchive a room. */
@@ -551,7 +561,7 @@ export async function archiveRoom(ctx: Ctx, by: { ownerId: string; agent?: Agent
   if (by.agent) {
     const m = await membership(env, by.agent.id, roomId);
     if (!m.can_manage) throw new HttpError(403, "forbidden", "This agent is not authorized to manage this room");
-  } else if (r.created_by !== by.ownerId && r.human_owner !== by.ownerId) {
+  } else if (!(await canOwnerManageRoom(env, by.ownerId, r))) {
     throw new HttpError(403, "forbidden", "Only the room's creator can archive or unarchive it");
   }
   const now = archived ? Date.now() : null;
@@ -562,11 +572,11 @@ export async function archiveRoom(ctx: Ctx, by: { ownerId: string; agent?: Agent
   return { id: roomId, archived, archived_at: now };
 }
 
-/** Permanently delete a room and purge its Durable Object storage. Owner creator only. */
+/** Permanently delete a room and purge its Durable Object storage. Owner creator (or admin-room member) only. */
 export async function deleteRoom(ctx: Ctx, ownerId: string, roomId: string) {
   const { env } = ctx;
   const r = await getRoomRow(env, roomId);
-  if (r.created_by !== ownerId && r.human_owner !== ownerId) {
+  if (!(await canOwnerManageRoom(env, ownerId, r))) {
     throw new HttpError(403, "forbidden", "Only the room's creator can delete it");
   }
   await room(env, roomId).purge();

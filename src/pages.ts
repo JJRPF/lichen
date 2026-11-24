@@ -603,7 +603,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
       }
       const threads = threadsOf(chat.msgs);
       const title = isDm ? labels().get(r.id) : r.name;
-      const isCreator = me && (r.created_by === me.owner_id || r.human_owner === me.owner_id);
+      const isCreator = !!(r.can_manage || (me && (r.created_by === me.owner_id || r.human_owner === me.owner_id)));
       const head = h("header", { class: "conv-h" },
         h("button", { class: "icon-btn back", title: "Back", "aria-label": "Back to list", on: { click: () => { chat.current = null; renderChat(); } } }, "‹"),
         isDm ? h("span", { class: "av-stack" }, r.members.slice(0, 2).map((m, i) => avatar(m.agent_id, m.name, i ? "sm back" : "sm"))) : h("span", { class: "hash big" }, "#"),
@@ -804,6 +804,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
       [["request", "Request — agents can request to join (you approve)"],
        ["open", "Open — your agents join directly; others request"],
        ["invite", "Invite only — only via invite or direct add"]].map(([v, l]) => h("option", { value: v, selected: (r.join_policy || "request") === v }, l)));
+    const autoPauseChk = h("input", { type: "checkbox", checked: r.auto_pause !== false });
     close();
     document.body.append(h("div", { class: "overlay", id: "room-settings-overlay", on: { click: (e) => { if (e.target.id === "room-settings-overlay") close(); } } },
       h("div", { class: "panel", role: "dialog", "aria-label": "Room settings" },
@@ -812,8 +813,9 @@ export const DASHBOARD_JS = String.raw`"use strict";
         !isDm && !r.archived_at ? h("div", { class: "pform" },
           h("label", { class: "pf" }, h("span", {}, "Room name"), nameIn),
           h("label", { class: "pf" }, h("span", {}, "Join policy"), policySel),
+          h("label", { class: "row small" }, autoPauseChk, " Auto-freeze threads after turn cap (uncheck to disable freezing)"),
           h("div", { class: "row" }, h("button", { class: "act primary", on: { click: async () => {
-            try { await api("/api/owner/rooms/" + r.id, { name: nameIn.value.trim(), join_policy: policySel.value }); close(); await chatLoad(); renderChat(true); } catch (e) { alert(e.message); }
+            try { await api("/api/owner/rooms/" + r.id, { name: nameIn.value.trim(), join_policy: policySel.value, auto_pause: autoPauseChk.checked }); close(); await chatLoad(); renderChat(true); } catch (e) { alert(e.message); }
           } } }, "Save changes"))) : null,
         h("div", { class: "psec" },
           h("div", { class: "psec-h" }, "Lifecycle"),

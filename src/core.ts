@@ -108,13 +108,13 @@ export async function membership(env: Env, agentId: string, roomId: string): Pro
 
 export interface MemberRow {
   agent_id: string; owner_id: string; name: string; role: string; can_manage: number;
-  kind: string; human_owner: string | null; archived_at: number | null;
+  kind: string; human_owner: string | null; archived_at: number | null; auto_pause: number;
 }
 
 /** Active members of a room, with the room's kind (one D1 query). */
 export async function roomMembers(env: Env, roomId: string): Promise<MemberRow[]> {
   const { results } = await env.DB.prepare(
-    `SELECT m.agent_id, a.owner_id, a.name, m.role, m.can_manage, r.kind, r.human_owner, r.archived_at
+    `SELECT m.agent_id, a.owner_id, a.name, m.role, m.can_manage, r.kind, r.human_owner, r.archived_at, r.auto_pause
      FROM memberships m JOIN agents a ON a.id = m.agent_id JOIN rooms r ON r.id = m.room_id
      WHERE m.room_id = ? AND a.status = 'active'`,
   ).bind(roomId).all<MemberRow>();
@@ -122,7 +122,7 @@ export async function roomMembers(env: Env, roomId: string): Promise<MemberRow[]
 }
 
 /** Fan-out targets for a room, minus the sender. Members are kept for @mention lookup. */
-export type RoomFanout = Fanout & { members: MemberRow[] };
+export type RoomFanout = Fanout & { members: MemberRow[]; autoPause?: boolean };
 
 function fanoutFor(roomId: string, rows: MemberRow[], senderId: string | null): RoomFanout {
   const first = rows[0];
@@ -131,6 +131,7 @@ function fanoutFor(roomId: string, rows: MemberRow[], senderId: string | null): 
     recipients: rows.filter((r) => r.agent_id !== senderId).map(({ agent_id, owner_id }) => ({ agent_id, owner_id })),
     owners: [...new Set(rows.map((r) => r.owner_id))],
     direct: !!first && isDirect({ kind: first.kind, human_owner: first.human_owner, members: rows.length }),
+    autoPause: first ? first.auto_pause !== 0 : true,
     members: rows,
   };
 }
@@ -213,11 +214,12 @@ export function checkBodySize(env: Env, text: string) {
 export interface Sent { id: string; room: string; seq: number; created_at: number; thread_paused: boolean }
 
 /** Append a message as `sender` and notify the room. Membership must already be checked (fanout). */
-export async function sendInto(ctx: Ctx, sender: Agent, fanout: Fanout, text: string, meta: MessageMeta, kind: "message" | "poll" = "message"): Promise<Sent> {
+export async function sendInto(ctx: Ctx, sender: Agent, fanout: RoomFanout | Fanout, text: string, meta: MessageMeta, kind: "message" | "poll" = "message"): Promise<Sent> {
   const { env } = ctx;
   const envelope: Envelope = { sender_id: sender.id, sender_owner_id: sender.owner_id };
+  const autoPause = "autoPause" in fanout ? fanout.autoPause !== false : true;
   const res = await room(env, fanout.roomId).sendMessage(envelope, text, meta, {
-    turnCap: Number(env.TURN_CAP ?? 10),
+    turnCap: autoPause ? Number(env.TURN_CAP ?? 10) : 0,
     cooldownMs: Number(env.COOLDOWN_MS ?? 2000),
   }, stripMembers(fanout), kind);
   if (!res.ok) {
