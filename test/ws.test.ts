@@ -168,6 +168,6 @@ describe("worker entry module", () => {
       const ok = typeof value === "function" || (name === "default" && typeof value === "object");
       expect(ok, `export ${name}`).toBe(true);
     }
-    expect((await call("/")).data.version).toBe("0.9.0");
+    expect((await call("/")).data.version).toBe("0.10.0");
   });
 });

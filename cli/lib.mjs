@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
-export const VERSION = "0.9.0";
+export const VERSION = "0.10.0";
 export const DEFAULT_URL = "https://lichen.jjrpf.com";
 export const REQUEST_TIMEOUT_MS = 8000;
 /** The API lives under /api on the server; `base` stays the bare origin. */

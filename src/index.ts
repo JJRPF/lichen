@@ -12,7 +12,7 @@ import { AgentSocket, CLOSE_ROTATED } from "./agent";
 import { VERSION, type Env } from "./env";
 import {
   type Agent, type Ctx, PAGE_LIMIT, REACTIONS, agentHub, audit, authAgent, cleanMeta, checkBodySize, connect, memberships,
-  membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, roomMembers, rateLimit, readHistory, requireAdmin, room, sendInto,
+  createWebhook, membership, mintEnrollCode, newNtfyTopic, postingMembership, prepareMeta, isDirect, present, roomMembers, rateLimit, readHistory, requireAdmin, room, sendInto,
 } from "./core";
 import {
   acceptInvite, agentApprovals, createInvite, createRoom, findAgents, forwardMessage, joinOnEnroll, lookupInvite, publicInvite, requestDm,
@@ -26,7 +26,6 @@ const prefersMarkdown = (req: Request) => {
   const a = req.headers.get("accept") ?? "";
   return a.includes("text/markdown") && !/^\s*text\/html/.test(a);
 };
-import { checkWebhookUrl } from "./webhooks";
 import { attachImages, cleanPoll, serveImage, uploadImage, voteError, voteOptions } from "./media";
 import { MAX_AVATAR_BYTES, cleanProfilePatch, getAvatar, getProfile, readBytes, saveAvatar, saveProfile } from "./profiles";
 import {
@@ -235,27 +234,13 @@ async function rotate(env: Env, agent: Agent): Promise<Response> {
 // ---------------------------------------------------------------- webhooks
 
 /**
- * POST /api/webhooks {url, authorization?, include_reactions?}: wake this
- * agent by webhook on new messages. The signing secret is returned once.
+ * POST /api/webhooks {url, authorization?, include_reactions?, include_ambient?}:
+ * wake this agent by webhook on new messages. A Claude Code routine fire URL
+ * becomes a batched routine wake; any other URL gets signed POSTs, and the
+ * signing secret is returned once.
  */
 async function addWebhook(req: Request, ctx: Ctx, agent: Agent): Promise<Response> {
-  const b = await readBody(req);
-  const url = checkWebhookUrl(b.url, ctx.origin);
-  const authorization = str(b.authorization, "authorization", 1024);
-  if (authorization !== undefined && (/[\r\n]/.test(authorization) || !/^\S+ \S/.test(authorization))) {
-    throw new HttpError(400, "invalid_field", 'authorization must look like "Bearer <token>"');
-  }
-  const r = await agentHub(ctx.env, agent.id).addWebhook({
-    agentId: agent.id, origin: ctx.origin, url, authorization,
-    includeReactions: bool(b.include_reactions, "include_reactions", false),
-    includeAmbient: bool(b.include_ambient, "include_ambient", false),
-  });
-  if ("error" in r) throw new HttpError(409, r.error!, r.message);
-  await audit(ctx.env, agent.id, "webhook.create", r.webhook.id, { host: new URL(url).hostname, reactions: r.webhook.include_reactions });
-  return json({
-    ...r.webhook,
-    note: "Save the secret now; it isn't shown again. Verify each delivery's webhook-signature with it (Standard Webhooks).",
-  }, 201);
+  return json(await createWebhook(ctx, agent.id, agent.id, await readBody(req)), 201);
 }
 
 // ---------------------------------------------------------------- rooms / send / react

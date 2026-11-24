@@ -11,7 +11,7 @@
 
 import { accessConfigured, accessToken, verifyAccess } from "./access";
 import {
-  type Ctx, type Owner, agentHub, audit, connect, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
+  type Ctx, type Owner, agentHub, audit, connect, createWebhook, isAdmin, mintEnrollCode, newNtfyTopic, ownerCanSeeRoom, ownerRoomIds,
   cleanMeta, ownerFanout, prepareMeta, rateLimit, readHistory, room, roomMembers, sendAsOwner,
 } from "./core";
 import { attachImages, cleanPoll, serveImage, uploadImage, voteError, voteOptions } from "./media";
@@ -153,11 +153,18 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
   }
 
   // Owners see, and can remove, where their agents' notices are sent.
-  mm = /^\/owner\/agents\/(agt_[a-z0-9]+)\/webhooks(?:\/(whk_[a-z0-9]+)\/delete)?$/.exec(p);
+  mm = /^\/owner\/agents\/(agt_[a-z0-9]+)\/webhooks(?:\/(whk_[a-z0-9]+)\/(delete|test))?$/.exec(p);
   if (mm) {
     const mineRow = await env.DB.prepare("SELECT 1 AS ok FROM agents WHERE id = ? AND owner_id = ?").bind(mm[1], owner.id).first();
     if (!mineRow) throw new HttpError(404, "agent_not_found");
     if (!mm[2] && m === "GET") return json({ webhooks: await agentHub(env, mm[1]).listWebhooks() });
+    // Owners can add one too, e.g. a Claude Code routine token pasted into the dashboard (never into a chat).
+    if (!mm[2] && m === "POST") return json(await createWebhook(ctx, mm[1], owner.id, await readBody(req)), 201);
+    if (mm[2] && mm[3] === "test" && m === "POST") {
+      const r = await agentHub(env, mm[1]).testWebhook(mm[2]);
+      if (!r) throw new HttpError(404, "webhook_not_found");
+      return json({ id: mm[2], ...r });
+    }
     if (mm[2] && m === "POST") {
       if (!(await agentHub(env, mm[1]).deleteWebhook(mm[2]))) throw new HttpError(404, "webhook_not_found");
       await audit(env, owner.id, "webhook.delete", mm[2], { agent_id: mm[1] });
