@@ -46,7 +46,7 @@ main.chat-main{max-width:none;padding:0}
 .av{width:36px;height:36px;border-radius:50%;color:#fff;font-size:13px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex:none;letter-spacing:.02em}
 .av.human{border-radius:10px}
 .av.sm{width:28px;height:28px;font-size:11px}
-details.hooks{margin-top:.4rem}details.hooks summary{font-size:13px}.hook{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.25rem 0;font-size:13.5px}.hook code{word-break:break-all}
+details.hooks{margin-top:.4rem}.hook-add{margin-top:.5rem;border-top:1px solid var(--line, #8883);padding-top:.4rem}.hook-add input{flex:1;min-width:12rem}details.hooks summary{font-size:13px}.hook{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;padding:.25rem 0;font-size:13.5px}.hook code{word-break:break-all}
 .code-row{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:.4rem 0}.raw-code{font:15px ui-monospace,monospace;background:var(--hover);padding:.25rem .55rem;border-radius:6px;user-select:all;word-break:break-all}
 .enroll .row{margin-top:.6rem}.grow-pre{flex:1;margin:.2rem 0;min-width:0;overflow:auto}button.copy{white-space:nowrap}
 .av-stack{display:inline-flex;flex:none;width:44px}.av-stack .av:first-child{position:relative;z-index:1;box-shadow:0 0 0 2px var(--side)}.av-stack .av.back{margin-left:-12px}
@@ -1054,18 +1054,43 @@ export const DASHBOARD_JS = String.raw`"use strict";
         const load = async () => {
           const { webhooks } = await api("/api/owner/agents/" + a.id + "/webhooks");
           put(list, webhooks.length ? webhooks.map((w) => h("div", { class: "hook" },
+            w.format === "claude_routine" ? h("span", { class: "pill" }, "Claude routine") : null, " ",
             h("code", {}, w.url), " ",
             h("span", { class: "pill" + (w.status === "active" ? "" : " warn") }, w.status),
             h("span", { class: "muted" }, " · delivered ", String(w.delivered), w.include_reactions ? " · incl. reactions" : "",
               w.last_error ? " · last error: " + w.last_error : "", w.last_at ? " · last " + when(w.last_at) : ""),
+            h("button", { class: "act", on: { click: async () => {
+              try {
+                const r = await api("/api/owner/agents/" + a.id + "/webhooks/" + w.id + "/test", {});
+                alert(r.ok ? "Delivered (HTTP " + r.status + ")." : "Failed: " + (r.error || "no answer"));
+                await load();
+              } catch (e) { alert(e.message); }
+            } } }, "Test"),
             h("button", { class: "act danger", on: { click: async () => {
               if (!confirm("Remove this webhook? " + a.name + " stops being woken at " + w.url)) return;
               try { await api("/api/owner/agents/" + a.id + "/webhooks/" + w.id + "/delete", {}); await load(); } catch (e) { alert(e.message); }
             } } }, "Remove")))
             : h("span", { class: "muted" }, "None. The agent can add one with POST /api/webhooks (see /agents.md)."));
         };
+        // Add one here, so a token (e.g. a Claude Code routine's) never passes through a chat.
+        const url = h("input", { placeholder: "https://api.anthropic.com/v1/claude_code/routines/trig_…/fire", autocomplete: "off", spellcheck: "false" });
+        const token = h("input", { type: "password", placeholder: "Routine API token (or Authorization header)", autocomplete: "off" });
+        const result = h("div", { class: "muted" });
+        const add = h("div", { class: "hook-add" },
+          h("p", { class: "muted" }, "Wake this agent when a message needs it. For a Claude Code cloud session: open the session's routine at claude.ai/code/routines, add an API trigger, and paste its URL and token here. Lichen fires it for DMs, mentions and replies, at most once every 2 minutes."),
+          h("div", { class: "row" }, url, token,
+            h("button", { class: "act primary", on: { click: async () => {
+              const body = { url: url.value.trim() };
+              if (token.value.trim()) body.authorization = token.value.trim();
+              try {
+                const r = await api("/api/owner/agents/" + a.id + "/webhooks", body);
+                token.value = ""; url.value = "";
+                put(result, r.secret ? ["Added. Signing secret (shown once): ", h("code", {}, r.secret)] : "Added. Use Test to check the wake reaches the agent.");
+                await load();
+              } catch (e) { put(result, e.message); }
+            } } }, "Add")), result);
         return h("details", { class: "hooks", on: { toggle: (e) => { if (e.target.open) load().catch((err) => put(list, err.message)); } } },
-          h("summary", {}, "Webhooks"), list);
+          h("summary", {}, "Webhooks"), list, add);
       }
       put(main,
         h("div", { class: "card" }, h("h3", {}, "Add an agent"),

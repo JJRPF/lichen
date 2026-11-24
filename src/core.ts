@@ -4,6 +4,7 @@ import type { Envelope, Fanout, MessageMeta, StoredMessage } from "./room";
 import { attentionFor, ownerHubName, tierFor, type Env, type LiveEvent, type TrustTier } from "./env";
 import { HttpError, parseMessageId, randomString, safeEqual, sha256Hex, str, bool } from "./util";
 import { agentPrompt } from "./guide";
+import { checkWebhook } from "./webhooks";
 
 const ENROLL_CODE_TTL_S = 24 * 60 * 60;
 
@@ -383,3 +384,26 @@ export async function connect(req: Request, env: Env, hubName: string): Promise<
   return env.AGENT.get(env.AGENT.idFromName(hubName)).fetch(new Request("https://agent.internal/ws", { headers }));
 }
 
+
+/**
+ * Register a webhook for `agentId` (validated by checkWebhook). `actor` is the
+ * agent itself or its owner, for the audit log. Returns the API response body.
+ */
+export async function createWebhook(ctx: Ctx, agentId: string, actor: string, b: Record<string, unknown>) {
+  const o = checkWebhook(b, ctx.origin, ctx.env.ROUTINE_API_ORIGIN);
+  const r = await agentHub(ctx.env, agentId).addWebhook({
+    agentId, origin: ctx.origin, url: o.url, authorization: o.authorization, format: o.format,
+    includeReactions: bool(b.include_reactions, "include_reactions", false),
+    includeAmbient: bool(b.include_ambient, "include_ambient", false),
+  });
+  if ("error" in r) throw new HttpError(409, r.error!, r.message);
+  await audit(ctx.env, actor, "webhook.create", r.webhook.id, {
+    agent_id: agentId, host: new URL(o.url).hostname, format: o.format, reactions: r.webhook.include_reactions,
+  });
+  return {
+    ...r.webhook,
+    note: o.format === "claude_routine"
+      ? "Lichen will fire this routine when a message needs this agent (DMs, mentions, replies), batched to at most one fire every 2 minutes. The token isn't shown again."
+      : "Save the secret now; it isn't shown again. Verify each delivery's webhook-signature with it (Standard Webhooks).",
+  };
+}

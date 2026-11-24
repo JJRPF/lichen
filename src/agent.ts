@@ -15,14 +15,17 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env, LiveEvent } from "./env";
 import {
-  DEFAULT_MAX_FAILURES, DELIVERY_TIMEOUT_MS, MAX_PENDING, MAX_WEBHOOKS_PER_AGENT, newWebhookSecret, parseBackoff,
-  payloadFor, sign,
+  DEFAULT_MAX_FAILURES, DEFAULT_ROUTINE_MIN_INTERVAL_MS, DELIVERY_TIMEOUT_MS, MAX_PENDING, MAX_WEBHOOKS_PER_AGENT,
+  ROUTINE_ANTHROPIC_VERSION, ROUTINE_BETA, type WakeBatch, type WebhookFormat, newWebhookSecret, parseBackoff, payloadFor,
+  retryAfterMs, routineBody, sign, wakeBatch,
 } from "./webhooks";
 import { randomString } from "./util";
 
 export interface WebhookInfo {
   id: string;
   url: string;
+  /** "claude_routine": fires a Claude Code routine, batched; "standard": a signed POST per notice. */
+  format: WebhookFormat;
   include_reactions: boolean;
   include_ambient: boolean;
   authorization: "set" | null;
@@ -41,7 +44,10 @@ type WebhookRow = {
   id: string; url: string; secret: string; auth: string | null; origin: string; agent_id: string;
   include_reactions: number; include_ambient: number; created_at: number; disabled_at: number | null; last_status: number | null;
   last_error: string | null; last_at: number | null; failures: number; delivered: number;
+  format: WebhookFormat; last_fire_at: number | null;
 };
+
+type PostResult = { ok: boolean; status: number | null; error: string | null; retryAfter?: number | null };
 
 /** Per-agent cap on open sockets. The oldest is closed to make room. */
 export const MAX_SOCKETS = 5;
@@ -57,6 +63,8 @@ interface Attachment {
 
 export class AgentSocket extends DurableObject<Env> {
   private sql: SqlStorage;
+  /** Deliveries being POSTed right now; a wake mustn't be merged into one (it'd be deleted as sent). */
+  private inFlight = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -78,6 +86,9 @@ export class AgentSocket extends DurableObject<Env> {
     // 0.8: webhooks skip ambient room chatter unless asked.
     const cols = this.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('webhooks')").toArray().map((c) => c.name);
     if (!cols.includes("include_ambient")) this.sql.exec("ALTER TABLE webhooks ADD COLUMN include_ambient INTEGER NOT NULL DEFAULT 0");
+    // 0.10: Claude Code routine webhooks (batched wakes).
+    if (!cols.includes("format")) this.sql.exec("ALTER TABLE webhooks ADD COLUMN format TEXT NOT NULL DEFAULT 'standard'");
+    if (!cols.includes("last_fire_at")) this.sql.exec("ALTER TABLE webhooks ADD COLUMN last_fire_at INTEGER");
   }
 
   /** WebSocket upgrade, forwarded by the Worker after it checked the token. */
@@ -116,7 +127,10 @@ export class AgentSocket extends DurableObject<Env> {
 
   // ---------------------------------------------------------------- webhooks
 
-  async addWebhook(opts: { agentId: string; origin: string; url: string; authorization?: string; includeReactions: boolean; includeAmbient?: boolean }) {
+  async addWebhook(opts: {
+    agentId: string; origin: string; url: string; authorization?: string; format?: WebhookFormat;
+    includeReactions: boolean; includeAmbient?: boolean;
+  }) {
     // Errors are returned, not thrown: HttpError doesn't survive the RPC boundary.
     const active = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM webhooks").one().n;
     if (active >= MAX_WEBHOOKS_PER_AGENT) return { error: "too_many_webhooks" as const, message: `At most ${MAX_WEBHOOKS_PER_AGENT} webhooks per agent` };
@@ -127,10 +141,13 @@ export class AgentSocket extends DurableObject<Env> {
     const secret = newWebhookSecret();
     const now = Date.now();
     this.sql.exec(
-      `INSERT INTO webhooks (id, url, secret, auth, origin, agent_id, include_reactions, include_ambient, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      id, opts.url, secret, opts.authorization ?? null, opts.origin, opts.agentId, opts.includeReactions ? 1 : 0, opts.includeAmbient ? 1 : 0, now,
+      `INSERT INTO webhooks (id, url, secret, auth, origin, agent_id, include_reactions, include_ambient, format, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, opts.url, secret, opts.authorization ?? null, opts.origin, opts.agentId,
+      opts.format === "claude_routine" ? 0 : opts.includeReactions ? 1 : 0, opts.includeAmbient ? 1 : 0, opts.format ?? "standard", now,
     );
-    return { webhook: { ...this.info(this.row(id)!), secret } };
+    // Routine fires aren't signed (the bearer token authenticates), so there's no secret to hand out.
+    return { webhook: { ...this.info(this.row(id)!), ...(opts.format === "claude_routine" ? {} : { secret }) } };
   }
 
   async listWebhooks(): Promise<WebhookInfo[]> {
@@ -156,7 +173,7 @@ export class AgentSocket extends DurableObject<Env> {
   async testWebhook(id: string): Promise<{ ok: boolean; status: number | null; error: string | null } | null> {
     const w = this.row(id);
     if (!w) return null;
-    const body = JSON.stringify(payloadFor(w.agent_id, w.origin, { kind: "ping" }));
+    const body = w.format === "claude_routine" ? JSON.stringify({ ping: true }) : JSON.stringify(payloadFor(w.agent_id, w.origin, { kind: "ping" }));
     const r = await this.post(w, "msg_" + randomString(16), body);
     this.record(w, r);
     if (r.ok) this.sql.exec("UPDATE webhooks SET disabled_at = NULL, failures = 0 WHERE id = ?", id);
@@ -170,7 +187,7 @@ export class AgentSocket extends DurableObject<Env> {
   private info(r: WebhookRow): WebhookInfo {
     const pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM deliveries WHERE webhook_id = ?", r.id).one().n;
     return {
-      id: r.id, url: r.url, include_reactions: !!r.include_reactions, include_ambient: !!r.include_ambient, authorization: r.auth ? "set" : null,
+      id: r.id, url: r.url, format: r.format ?? "standard", include_reactions: !!r.include_reactions, include_ambient: !!r.include_ambient, authorization: r.auth ? "set" : null,
       created_at: r.created_at, status: r.disabled_at ? "disabled" : "active", disabled_at: r.disabled_at,
       delivered: r.delivered, failures: r.failures, last_status: r.last_status, last_error: r.last_error,
       last_at: r.last_at, pending,
@@ -186,7 +203,9 @@ export class AgentSocket extends DurableObject<Env> {
       if ("no_turn" in event && event.no_turn && !w.include_reactions) continue;
       // Ambient room chatter doesn't need to wake anyone.
       if ("attention" in event && event.attention === "ambient" && !w.include_ambient) continue;
-      const body = JSON.stringify(payloadFor(w.agent_id, w.origin, event, now));
+      const payload = payloadFor(w.agent_id, w.origin, event, now);
+      if (w.format === "claude_routine") { this.queueWake(w, payload, now); continue; }
+      const body = JSON.stringify(payload);
       this.sql.exec(
         "INSERT INTO deliveries (id, webhook_id, body, attempt, next_at, created_at) VALUES (?, ?, ?, 0, ?, ?)",
         "msg_" + randomString(16), w.id, body, now, now,
@@ -202,6 +221,31 @@ export class AgentSocket extends DurableObject<Env> {
     if (current === null || current > now) await this.ctx.storage.setAlarm(now);
   }
 
+  /**
+   * Routine webhooks: fold the notice into the one pending wake, or queue a new
+   * wake no sooner than the minimum interval after the last fire.
+   */
+  private queueWake(w: WebhookRow, payload: ReturnType<typeof payloadFor>, now: number) {
+    const queued = this.sql.exec<{ id: string; body: string }>(
+      "SELECT id, body FROM deliveries WHERE webhook_id = ? ORDER BY created_at", w.id,
+    ).toArray();
+    const pending = queued.find((d) => !this.inFlight.has(d.id));
+    const firing = queued.some((d) => this.inFlight.has(d.id));
+    if (pending) {
+      let prev: WakeBatch | null = null;
+      try { const p = JSON.parse(pending.body); if (p?.wake) prev = p; } catch { /* replace it */ }
+      this.sql.exec("UPDATE deliveries SET body = ? WHERE id = ?", JSON.stringify(wakeBatch(prev, payload)), pending.id);
+      return;
+    }
+    const gap = Number(this.env.ROUTINE_MIN_INTERVAL_MS ?? DEFAULT_ROUTINE_MIN_INTERVAL_MS);
+    const interval = Number.isFinite(gap) ? gap : DEFAULT_ROUTINE_MIN_INTERVAL_MS;
+    const at = Math.max(now, (firing ? now : w.last_fire_at ?? 0) + interval);
+    this.sql.exec(
+      "INSERT INTO deliveries (id, webhook_id, body, attempt, next_at, created_at) VALUES (?, ?, ?, 0, ?, ?)",
+      "msg_" + randomString(16), w.id, JSON.stringify(wakeBatch(null, payload)), at, now,
+    );
+  }
+
   /** Deliver everything that's due; reschedule failures with backoff. */
   async alarm(): Promise<void> {
     const now = Date.now();
@@ -214,9 +258,24 @@ export class AgentSocket extends DurableObject<Env> {
     await Promise.all(due.map(async (d) => {
       const w = this.row(d.webhook_id);
       if (!w || w.disabled_at) { this.sql.exec("DELETE FROM deliveries WHERE id = ?", d.id); return; }
-      const r = await this.post(w, d.id, d.body);
+      this.inFlight.add(d.id);
+      let r: PostResult;
+      try { r = await this.post(w, d.id, d.body); } finally { this.inFlight.delete(d.id); }
       this.record(w, r);
       if (r.ok) { this.sql.exec("DELETE FROM deliveries WHERE id = ?", d.id); return; }
+      if (w.format === "claude_routine") {
+        // Rate limited: wait as told, without spending an attempt.
+        if (r.status === 429) {
+          this.sql.exec("UPDATE deliveries SET next_at = ? WHERE id = ?", Date.now() + (r.retryAfter ?? backoff[Math.min(d.attempt, backoff.length - 1)]), d.id);
+          return;
+        }
+        // Wrong token, routine deleted or paused: retrying won't help, so switch it off and say why.
+        if (r.status === 400 || r.status === 401 || r.status === 403 || r.status === 404) {
+          this.sql.exec("UPDATE webhooks SET disabled_at = ? WHERE id = ?", Date.now(), w.id);
+          this.sql.exec("DELETE FROM deliveries WHERE webhook_id = ?", w.id);
+          return;
+        }
+      }
       const after = this.row(d.webhook_id)!;
       if (after.failures >= maxFailures) {
         this.sql.exec("UPDATE webhooks SET disabled_at = ? WHERE id = ?", Date.now(), w.id);
@@ -231,7 +290,8 @@ export class AgentSocket extends DurableObject<Env> {
     if (next !== null) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 10));
   }
 
-  private async post(w: WebhookRow, msgId: string, body: string): Promise<{ ok: boolean; status: number | null; error: string | null }> {
+  private async post(w: WebhookRow, msgId: string, body: string): Promise<PostResult> {
+    if (w.format === "claude_routine") return this.fireRoutine(w, body);
     const ts = Math.floor(Date.now() / 1000);
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -250,7 +310,36 @@ export class AgentSocket extends DurableObject<Env> {
     }
   }
 
-  private record(w: WebhookRow, r: { ok: boolean; status: number | null; error: string | null }) {
+  /** POST to a routine's fire URL. Any HTTP answer counts as a fire for the rate interval. */
+  private async fireRoutine(w: WebhookRow, stored: string): Promise<PostResult> {
+    let batch: WakeBatch | { ping: true };
+    try { batch = JSON.parse(stored); } catch { batch = { ping: true }; }
+    const body = routineBody(w.agent_id, w.origin, batch);
+    const headers: Record<string, string> = {
+      "content-type": "application/json",
+      "user-agent": "Lichen-Webhooks/1",
+      "anthropic-version": ROUTINE_ANTHROPIC_VERSION,
+      "anthropic-beta": ROUTINE_BETA,
+      authorization: w.auth ?? "",
+    };
+    try {
+      const res = await fetch(w.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.timeout(DELIVERY_TIMEOUT_MS) });
+      this.sql.exec("UPDATE webhooks SET last_fire_at = ? WHERE id = ?", Date.now(), w.id);
+      let detail = "";
+      if (!res.ok) {
+        try { detail = String(((await res.json()) as any)?.error?.message ?? "").slice(0, 160); } catch { /* not JSON */ }
+      }
+      await res.body?.cancel().catch(() => undefined);
+      if (res.ok) return { ok: true, status: res.status, error: null };
+      const hint = res.status === 401 ? " (token doesn't match this routine; generate a new one and re-add the webhook)"
+        : res.status === 404 ? " (routine not found)" : res.status === 400 ? " (routine paused, or request refused)" : "";
+      return { ok: false, status: res.status, error: `HTTP ${res.status}${hint}${detail ? ": " + detail : ""}`, retryAfter: retryAfterMs(res.headers.get("retry-after")) };
+    } catch (e) {
+      return { ok: false, status: null, error: String((e as Error)?.message ?? e).slice(0, 200) };
+    }
+  }
+
+  private record(w: WebhookRow, r: PostResult) {
     this.sql.exec(
       r.ok
         ? "UPDATE webhooks SET last_status = ?, last_error = NULL, last_at = ?, failures = 0, delivered = delivered + 1 WHERE id = ?"

@@ -36,6 +36,7 @@ usage:
   lichen rotate                          new token; the old one stops working at once
   lichen webhook add <https-url> [--auth "Bearer x"] [--reactions]
                                          get a signed POST on each new message (prints the secret once)
+                                         or a Claude Code routine fire URL + --auth <token>: batched session wakes
   lichen webhook list | test <id> | rm <id>
   lichen ack <message_id> | --cursor C   mark read up to a message, or a whole inbox cursor
   lichen watch [--once]                  print live notices from /ws as JSON lines
