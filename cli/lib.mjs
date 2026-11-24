@@ -9,7 +9,7 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync } from "n
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
-export const VERSION = "0.10.0";
+export const VERSION = "0.11.0";
 export const DEFAULT_URL = "https://lichen.jjrpf.com";
 export const REQUEST_TIMEOUT_MS = 8000;
 /** The API lives under /api on the server; `base` stays the bare origin. */
@@ -216,8 +216,13 @@ function renderMessage(m, bodyLimit) {
   if (m.kind === "reaction") {
     return `${head.join(" · ")} · reaction ${oneLine(m.emoji, 16)} on \`${oneLine(m.target_id, 120)}\` (no_turn)`;
   }
+  if (m.deleted) {
+    return `${head.join(" · ")} · [message deleted]`;
+  }
   const meta = m.meta ?? {};
   const facts = [];
+  if (m.edited_at) facts.push("edited");
+  if (m.pinned_at) facts.push("pinned");
   if (meta.thread_id) facts.push(`thread: ${JSON.stringify(oneLine(meta.thread_id, 128))}`);
   if (meta.intent) facts.push(`intent: ${JSON.stringify(oneLine(meta.intent, 64))}`);
   if (meta.repo) facts.push(`repo: ${JSON.stringify(oneLine(meta.repo, 200))}`);
@@ -523,4 +528,166 @@ export function saveRotatedToken(token, env = process.env) {
   if (!saved) throw new CliError(`no token file at ${path} to update; save this token yourself`);
   writePrivate(path, JSON.stringify({ ...saved, token }, null, 2) + "\n");
   return path;
+}
+
+// ------------------------------------------------------------------ daemon
+
+export function daemonConfigPath(env = process.env) {
+  return join(lichenHome(env), "daemon.json");
+}
+
+export function loadDaemonConfig(env = process.env) {
+  return readJson(daemonConfigPath(env)) ?? null;
+}
+
+export function saveDaemonConfig(cfg, env = process.env) {
+  const path = daemonConfigPath(env);
+  writePrivate(path, JSON.stringify(cfg, null, 2) + "\n");
+  return path;
+}
+
+/** Whether a live notice or pending catch-up line should wake the local agent. */
+export function shouldWake(notice, { includeAmbient = false } = {}) {
+  if (!notice || typeof notice !== "object") return false;
+  if (notice.no_turn === true) return false;
+  if (notice.kind === "approval") return true;
+  if (notice.kind === "pending") return Boolean((notice.needs_reply ?? 0) > 0 || (notice.approvals ?? 0) > 0);
+  if (notice.attention) return includeAmbient || ["direct", "mention", "reply"].includes(notice.attention);
+  return true;
+}
+
+/** Safe environment variables passed to the daemon wake command (never shell-interpolated). */
+export function wakeEnv(batch) {
+  const rooms = [...new Set(batch.map((n) => n.room).filter(Boolean).map((r) => oneLine(r, 64)))];
+  const ids = [...new Set(batch.flatMap((n) => (n.kind === "pending" ? (n.ids ?? []) : n.id ? [n.id] : [])).map((x) => oneLine(x, 120)))].slice(0, 50);
+  const reasons = [...new Set(batch.map((n) => n.kind || n.attention || "message").map((x) => oneLine(x, 32)))];
+  return {
+    LICHEN_WAKE_COUNT: String(batch.length),
+    LICHEN_WAKE_ROOMS: rooms.join(","),
+    LICHEN_WAKE_IDS: ids.join(","),
+    LICHEN_WAKE_REASONS: reasons.join(","),
+  };
+}
+
+/**
+ * Single-flight, burst-batching wake scheduler for `lichen daemon`.
+ * - Ignores non-waking notices (reactions, ambient unless includeAmbient).
+ * - Waits `debounceMs` to batch bursts into one wake.
+ * - Never runs two wakes at once; notices arriving mid-wake trigger one follow-up
+ *   after `minIntervalMs` from the previous wake's start.
+ */
+export function createWakeScheduler({
+  runWake,
+  debounceMs = 3000,
+  minIntervalMs = 15_000,
+  includeAmbient = false,
+  now = () => Date.now(),
+  log = () => {},
+}) {
+  let pending = [];
+  let running = false;
+  let timer = null;
+  let lastStart = 0;
+  let wakes = 0;
+  let stopped = false;
+
+  const schedule = (delay) => {
+    if (stopped || timer || running) return;
+    timer = setTimeout(() => {
+      timer = null;
+      flush();
+    }, Math.max(0, delay));
+  };
+
+  const flush = async () => {
+    if (stopped || running || !pending.length) return;
+    const wait = lastStart ? Math.max(0, lastStart + minIntervalMs - now()) : 0;
+    if (wait > 0) {
+      schedule(wait);
+      return;
+    }
+    const batch = pending;
+    pending = [];
+    running = true;
+    lastStart = now();
+    wakes += 1;
+    try {
+      await runWake(batch);
+    } catch (e) {
+      log(`wake error: ${e?.message ?? e}`);
+    } finally {
+      running = false;
+      if (!stopped && pending.length) {
+        schedule(Math.max(debounceMs, lastStart + minIntervalMs - now()));
+      }
+    }
+  };
+
+  return {
+    push(notice) {
+      if (stopped || !shouldWake(notice, { includeAmbient })) return false;
+      pending.push(notice);
+      if (!running) schedule(debounceMs);
+      return true;
+    },
+    stop() {
+      stopped = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+    },
+    stats() {
+      return { running, pending: pending.length, wakes };
+    },
+  };
+}
+
+const xmlEsc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+export function systemdUnit({ nodePath, cliPath, home, tokenFilePath, url } = {}) {
+  const envLines = [
+    home ? `Environment=LICHEN_HOME=${home}` : null,
+    tokenFilePath ? `Environment=LICHEN_TOKEN_FILE=${tokenFilePath}` : null,
+    url ? `Environment=LICHEN_URL=${url}` : null,
+  ].filter(Boolean);
+  return `[Unit]
+Description=Lichen local agent wake daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${JSON.stringify(nodePath)} ${JSON.stringify(cliPath)} daemon run
+${envLines.join("\n")}${envLines.length ? "\n" : ""}Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+export function launchdPlist({ nodePath, cliPath, home, tokenFilePath, url, logPath } = {}) {
+  const envEntries = [
+    home ? `    <key>LICHEN_HOME</key><string>${xmlEsc(home)}</string>` : null,
+    tokenFilePath ? `    <key>LICHEN_TOKEN_FILE</key><string>${xmlEsc(tokenFilePath)}</string>` : null,
+    url ? `    <key>LICHEN_URL</key><string>${xmlEsc(url)}</string>` : null,
+  ].filter(Boolean);
+  const log = logPath || join(home || join(homedir(), ".lichen"), "daemon.log");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.lichen.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${xmlEsc(nodePath)}</string>
+    <string>${xmlEsc(cliPath)}</string>
+    <string>daemon</string>
+    <string>run</string>
+  </array>
+${envEntries.length ? `  <key>EnvironmentVariables</key>\n  <dict>\n${envEntries.join("\n")}\n  </dict>\n` : ""}  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${xmlEsc(log)}</string>
+  <key>StandardErrorPath</key><string>${xmlEsc(log)}</string>
+</dict>
+</plist>
+`;
 }

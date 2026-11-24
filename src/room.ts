@@ -62,6 +62,11 @@ export interface StoredMessage {
   target_seq: number | null; // reactions: the message reacted to
   emoji: string | null;
   created_at: number;
+  edited_at?: number | null;
+  deleted_at?: number | null;
+  deleted_by?: string | null;
+  pinned_at?: number | null;
+  pinned_by?: string | null;
 }
 
 export interface Limits {
@@ -130,7 +135,16 @@ export class Room extends DurableObject<Env> {
         claimed     INTEGER NOT NULL DEFAULT 0,
         created_at  INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pins (
+        seq        INTEGER PRIMARY KEY,
+        pinned_by  TEXT NOT NULL,
+        pinned_at  INTEGER NOT NULL
+      );
     `);
+    const cols = new Set(this.sql.exec<{ name: string }>("PRAGMA table_info(messages)").toArray().map((c) => c.name));
+    if (!cols.has("edited_at")) this.sql.exec("ALTER TABLE messages ADD COLUMN edited_at INTEGER");
+    if (!cols.has("deleted_at")) this.sql.exec("ALTER TABLE messages ADD COLUMN deleted_at INTEGER");
+    if (!cols.has("deleted_by")) this.sql.exec("ALTER TABLE messages ADD COLUMN deleted_by TEXT");
   }
 
   /** Append an agent message, applying the turn cap and cooldown. */
@@ -201,7 +215,7 @@ export class Room extends DurableObject<Env> {
   /** Reactions never count toward the turn cap and are flagged no_turn on read. */
   async react(env: Envelope, targetSeq: number, emoji: string, fanout?: Fanout): Promise<AppendResult> {
     const target = this.sql.exec<{ thread_id: string }>(
-      "SELECT thread_id FROM messages WHERE seq = ? AND kind IN ('message', 'poll')", targetSeq,
+      "SELECT thread_id FROM messages WHERE seq = ? AND kind IN ('message', 'poll') AND deleted_at IS NULL", targetSeq,
     ).toArray()[0];
     if (!target) return { ok: false, error: "target_not_found" };
     const now = Date.now();
@@ -243,6 +257,25 @@ export class Room extends DurableObject<Env> {
     this.ctx.waitUntil(work);
   }
 
+  private mapRow(r: Record<string, string | number | null>, voterId?: string): StoredMessage {
+    const m: StoredMessage = {
+      seq: r.seq as number,
+      kind: r.kind as StoredMessage["kind"],
+      sender_id: r.sender_id as string,
+      sender_owner_id: r.sender_owner_id as string,
+      body: (r.body as string | null) ?? null,
+      meta: r.meta ? (JSON.parse(r.meta as string) as MessageMeta) : null,
+      target_seq: (r.target_seq as number | null) ?? null,
+      emoji: (r.emoji as string | null) ?? null,
+      created_at: r.created_at as number,
+      ...(r.edited_at ? { edited_at: r.edited_at as number } : {}),
+      ...(r.deleted_at ? { deleted_at: r.deleted_at as number, deleted_by: (r.deleted_by as string | null) ?? null } : {}),
+      ...(r.pinned_at ? { pinned_at: r.pinned_at as number, pinned_by: (r.pinned_by as string | null) ?? null } : {}),
+    };
+    if (m.kind === "poll" && m.meta?.poll && !m.deleted_at) m.poll = this.pollState(m.seq, m.meta.poll, voterId);
+    return m;
+  }
+
   /** One message by seq, or null. */
   async getMessage(seq: number): Promise<StoredMessage | null> {
     return (await this.list({ afterSeq: seq - 1, beforeSeq: seq + 1, limit: 1 }))[0] ?? null;
@@ -250,35 +283,115 @@ export class Room extends DurableObject<Env> {
 
   /** Messages with seq > afterSeq, oldest first. */
   async list(opts: { afterSeq?: number; beforeSeq?: number; threadId?: string; excludeSender?: string; limit: number; voterId?: string }): Promise<StoredMessage[]> {
-    const where: string[] = ["seq > ?"];
+    const where: string[] = ["m.seq > ?"];
     const args: (string | number)[] = [opts.afterSeq ?? 0];
-    if (opts.beforeSeq !== undefined) { where.push("seq < ?"); args.push(opts.beforeSeq); }
-    if (opts.threadId !== undefined) { where.push("thread_id = ?"); args.push(opts.threadId); }
-    if (opts.excludeSender) { where.push("sender_id != ?"); args.push(opts.excludeSender); }
+    if (opts.beforeSeq !== undefined) { where.push("m.seq < ?"); args.push(opts.beforeSeq); }
+    if (opts.threadId !== undefined) { where.push("m.thread_id = ?"); args.push(opts.threadId); }
+    if (opts.excludeSender) { where.push("m.sender_id != ?"); args.push(opts.excludeSender); }
 
     // /history with `before` reads backwards; everything else reads forwards.
     const backwards = opts.beforeSeq !== undefined && opts.afterSeq === undefined;
     const rows = this.sql.exec<Record<string, string | number | null>>(
-      `SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY seq ${backwards ? "DESC" : "ASC"} LIMIT ?`,
+      `SELECT m.*, p.pinned_at, p.pinned_by FROM messages m LEFT JOIN pins p ON p.seq = m.seq
+       WHERE ${where.join(" AND ")} ORDER BY m.seq ${backwards ? "DESC" : "ASC"} LIMIT ?`,
       ...args, opts.limit,
     ).toArray();
     if (backwards) rows.reverse();
+    return rows.map((r) => this.mapRow(r, opts.voterId));
+  }
 
-    return rows.map((r) => {
-      const m: StoredMessage = {
-        seq: r.seq as number,
-        kind: r.kind as StoredMessage["kind"],
-        sender_id: r.sender_id as string,
-        sender_owner_id: r.sender_owner_id as string,
-        body: (r.body as string | null) ?? null,
-        meta: r.meta ? (JSON.parse(r.meta as string) as MessageMeta) : null,
-        target_seq: (r.target_seq as number | null) ?? null,
-        emoji: (r.emoji as string | null) ?? null,
-        created_at: r.created_at as number,
-      };
-      if (m.kind === "poll" && m.meta?.poll) m.poll = this.pollState(m.seq, m.meta.poll, opts.voterId);
-      return m;
-    });
+  private notifyOwners(roomId: string, seq: number, actorId: string, actorOwner: string, owners: string[]) {
+    if (!owners.length) return;
+    const n: Notice = { id: `${roomId}:${seq}`, room: roomId, from: actorId, trust_tier: "same_owner", no_turn: true };
+    this.ctx.waitUntil(Promise.allSettled([...new Set(owners)].map((o) =>
+      this.env.AGENT.get(this.env.AGENT.idFromName(ownerHubName(o))).notify({ ...n, trust_tier: tierFor(o, actorOwner) }))));
+  }
+
+  /** Edit a message's body. Agents edit only their own; owners can edit their own or their agents'. */
+  async editMessage(
+    seq: number, body: string, actorId: string, actorOwner: string, isOwner: boolean, owners: string[], roomId: string,
+  ): Promise<{ ok: true; message: StoredMessage } | { ok: false; error: "message_not_found" | "forbidden" | "not_editable" }> {
+    const row = this.sql.exec<Record<string, string | number | null>>(
+      "SELECT * FROM messages WHERE seq = ?", seq,
+    ).toArray()[0];
+    if (!row || row.deleted_at) return { ok: false, error: "message_not_found" };
+    if (row.kind !== "message") return { ok: false, error: "not_editable" };
+    const allowed = isOwner ? row.sender_owner_id === actorOwner : row.sender_id === actorId;
+    if (!allowed) return { ok: false, error: "forbidden" };
+    const now = Date.now();
+    this.sql.exec("UPDATE messages SET body = ?, edited_at = ? WHERE seq = ?", body, now, seq);
+    this.notifyOwners(roomId, seq, actorId, actorOwner, owners);
+    const updated = await this.getMessage(seq);
+    return { ok: true, message: updated! };
+  }
+
+  /** Soft-delete a message. Agents delete only their own; owners delete their own, their agents', or any in rooms they created. */
+  async deleteMessage(
+    seq: number, actorId: string, actorOwner: string, canModerate: boolean, owners: string[], roomId: string,
+  ): Promise<{ ok: true; deleted_at: number } | { ok: false; error: "message_not_found" | "forbidden" }> {
+    const row = this.sql.exec<{ sender_id: string; sender_owner_id: string; deleted_at: number | null }>(
+      "SELECT sender_id, sender_owner_id, deleted_at FROM messages WHERE seq = ?", seq,
+    ).toArray()[0];
+    if (!row || row.deleted_at) return { ok: false, error: "message_not_found" };
+    const allowed = canModerate || row.sender_id === actorId || (actorId === actorOwner && row.sender_owner_id === actorOwner);
+    if (!allowed) return { ok: false, error: "forbidden" };
+    const now = Date.now();
+    this.sql.exec("UPDATE messages SET body = NULL, deleted_at = ?, deleted_by = ? WHERE seq = ?", now, actorId, seq);
+    this.sql.exec("DELETE FROM pins WHERE seq = ?", seq);
+    this.sql.exec("DELETE FROM votes WHERE poll_seq = ?", seq);
+    this.notifyOwners(roomId, seq, actorId, actorOwner, owners);
+    return { ok: true, deleted_at: now };
+  }
+
+  // ---------------------------------------------------------------- pins & search
+
+  async pinMessage(
+    seq: number, actorId: string, actorOwner: string, owners: string[], roomId: string,
+  ): Promise<{ ok: true; pinned_at: number } | { ok: false; error: "message_not_found" }> {
+    const row = this.sql.exec<{ kind: string; deleted_at: number | null }>(
+      "SELECT kind, deleted_at FROM messages WHERE seq = ?", seq,
+    ).toArray()[0];
+    if (!row || row.deleted_at || (row.kind !== "message" && row.kind !== "poll")) return { ok: false, error: "message_not_found" };
+    const now = Date.now();
+    this.sql.exec(
+      "INSERT INTO pins (seq, pinned_by, pinned_at) VALUES (?, ?, ?) ON CONFLICT(seq) DO UPDATE SET pinned_by = excluded.pinned_by, pinned_at = excluded.pinned_at",
+      seq, actorId, now,
+    );
+    this.notifyOwners(roomId, seq, actorId, actorOwner, owners);
+    return { ok: true, pinned_at: now };
+  }
+
+  async unpinMessage(seq: number, actorId: string, actorOwner: string, owners: string[], roomId: string): Promise<boolean> {
+    const existing = this.sql.exec<{ seq: number }>("SELECT seq FROM pins WHERE seq = ?", seq).toArray()[0];
+    if (!existing) return false;
+    this.sql.exec("DELETE FROM pins WHERE seq = ?", seq);
+    this.notifyOwners(roomId, seq, actorId, actorOwner, owners);
+    return true;
+  }
+
+  async listPins(voterId?: string): Promise<StoredMessage[]> {
+    const rows = this.sql.exec<Record<string, string | number | null>>(
+      `SELECT m.*, p.pinned_at, p.pinned_by FROM pins p JOIN messages m ON m.seq = p.seq
+       WHERE m.deleted_at IS NULL ORDER BY p.pinned_at DESC LIMIT 100`,
+    ).toArray();
+    return rows.map((r) => this.mapRow(r, voterId));
+  }
+
+  /** Case-insensitive substring search over non-deleted messages and polls in this room. */
+  async search(query: string, limit: number, voterId?: string): Promise<StoredMessage[]> {
+    const like = "%" + query.toLowerCase().replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+    const rows = this.sql.exec<Record<string, string | number | null>>(
+      `SELECT m.*, p.pinned_at, p.pinned_by FROM messages m LEFT JOIN pins p ON p.seq = m.seq
+       WHERE m.deleted_at IS NULL AND m.kind IN ('message', 'poll') AND lower(COALESCE(m.body, '')) LIKE ? ESCAPE '\\'
+       ORDER BY m.seq DESC LIMIT ?`,
+      like, limit,
+    ).toArray();
+    return rows.map((r) => this.mapRow(r, voterId));
+  }
+
+  /** Wipe all data when a room is deleted. */
+  async purge(): Promise<void> {
+    this.sql.exec("DELETE FROM pins; DELETE FROM votes; DELETE FROM images; DELETE FROM cooldowns; DELETE FROM threads; DELETE FROM messages;");
   }
 
   // ---------------------------------------------------------------- polls
@@ -301,7 +414,7 @@ export class Room extends DurableObject<Env> {
    */
   async vote(voterId: string, voterOwner: string, seq: number, options: number[], owners: string[], roomId: string):
     Promise<{ ok: true; poll: PollState } | { ok: false; error: "poll_not_found" | "poll_closed" | "invalid_option" }> {
-    const row = this.sql.exec<{ meta: string }>("SELECT meta FROM messages WHERE seq = ? AND kind = 'poll'", seq).toArray()[0];
+    const row = this.sql.exec<{ meta: string }>("SELECT meta FROM messages WHERE seq = ? AND kind = 'poll' AND deleted_at IS NULL", seq).toArray()[0];
     if (!row) return { ok: false, error: "poll_not_found" };
     const p = (JSON.parse(row.meta) as MessageMeta).poll!;
     if (p.closes_at && p.closes_at <= Date.now()) return { ok: false, error: "poll_closed" };
@@ -354,7 +467,7 @@ export class Room extends DurableObject<Env> {
   /** Latest message, for sidebars: seq, time, sender and a short preview. */
   async summary(): Promise<{ last_seq: number; last_at: number | null; last: { sender_id: string; kind: string; preview: string } | null }> {
     const r = this.sql.exec<{ seq: number; created_at: number; sender_id: string; kind: string; body: string | null; emoji: string | null }>(
-      "SELECT seq, created_at, sender_id, kind, body, emoji FROM messages ORDER BY seq DESC LIMIT 1",
+      "SELECT seq, created_at, sender_id, kind, body, emoji FROM messages WHERE deleted_at IS NULL ORDER BY seq DESC LIMIT 1",
     ).toArray()[0];
     if (!r) return { last_seq: 0, last_at: null, last: null };
     const preview = r.kind === "reaction" ? (r.emoji ?? "") : (r.body ?? "").replace(/\s+/g, " ").slice(0, 140);

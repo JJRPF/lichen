@@ -23,27 +23,29 @@ const INVITE_TTL_S = 24 * 3600;
 
 // ---------------------------------------------------------------- rooms
 
-export interface NewMember { agent_id: string; role: "post" | "read" }
+export interface NewMember { agent_id: string; role: "post" | "read"; can_manage?: boolean }
 
-export async function createRoom(env: Env, name: string, kind: "room" | "dm", createdBy: string, members: NewMember[]) {
+export async function createRoom(
+  env: Env, name: string, kind: "room" | "dm", createdBy: string, members: NewMember[], joinPolicy: "invite" | "request" | "open" = "request",
+) {
   const roomId = newId("r");
   const now = Date.now();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO rooms (id, name, kind, created_by, created_at) VALUES (?, ?, ?, ?, ?)")
-      .bind(roomId, name, kind, createdBy, now),
+    env.DB.prepare("INSERT INTO rooms (id, name, kind, created_by, created_at, join_policy) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(roomId, name, kind, createdBy, now, joinPolicy),
     ...members.map((m) => env.DB.prepare(
-      `INSERT INTO memberships (room_id, agent_id, role, joined_at)
-       SELECT ?, id, ?, ? FROM agents WHERE id = ? AND status = 'active'`,
-    ).bind(roomId, m.role, now, m.agent_id)),
+      `INSERT INTO memberships (room_id, agent_id, role, can_manage, joined_at)
+       SELECT ?, id, ?, ?, ? FROM agents WHERE id = ? AND status = 'active'`,
+    ).bind(roomId, m.role, m.can_manage ? 1 : 0, now, m.agent_id)),
   ]);
   return roomId;
 }
 
-async function addMember(env: Env, roomId: string, agentId: string, role: "post" | "read") {
+async function addMember(env: Env, roomId: string, agentId: string, role: "post" | "read", canManage = false) {
   await env.DB.prepare(
-    `INSERT INTO memberships (room_id, agent_id, role, joined_at) VALUES (?, ?, ?, ?)
-     ON CONFLICT(room_id, agent_id) DO UPDATE SET role = excluded.role`,
-  ).bind(roomId, agentId, role, Date.now()).run();
+    `INSERT INTO memberships (room_id, agent_id, role, can_manage, joined_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(room_id, agent_id) DO UPDATE SET role = excluded.role, can_manage = excluded.can_manage`,
+  ).bind(roomId, agentId, role, canManage ? 1 : 0, Date.now()).run();
 }
 
 async function findDm(env: Env, a: string, b: string): Promise<string | null> {
@@ -500,4 +502,293 @@ export async function humanDm(ctx: Ctx, ownerId: string, agentId: string) {
   await env.DB.prepare("UPDATE rooms SET human_owner = ? WHERE id = ?").bind(ownerId, roomId).run();
   await audit(env, ownerId, "dm.human", roomId, { agent_id: agentId });
   return { room: roomId, agent_id: agentId, created: true };
+}
+
+// ---------------------------------------------------------------- room management & join requests
+
+const JOIN_POLICIES = new Set(["invite", "request", "open"]);
+
+interface RoomRow {
+  id: string; name: string; kind: string; created_by: string; human_owner: string | null;
+  archived_at: number | null; join_policy: string;
+}
+
+async function getRoomRow(env: Env, roomId: string): Promise<RoomRow> {
+  const r = await env.DB.prepare(
+    "SELECT id, name, kind, created_by, human_owner, archived_at, join_policy FROM rooms WHERE id = ?",
+  ).bind(roomId).first<RoomRow>();
+  if (!r) throw new HttpError(404, "room_not_found");
+  return r;
+}
+
+/** Rename a room or update its join_policy. Owner creator, or an authorized agent (can_manage). */
+export async function updateRoom(ctx: Ctx, by: { ownerId: string; agent?: Agent }, roomId: string, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const r = await getRoomRow(env, roomId);
+  if (by.agent) {
+    const m = await membership(env, by.agent.id, roomId);
+    if (!m.can_manage) throw new HttpError(403, "forbidden", "This agent is not authorized to manage this room");
+  } else if (r.created_by !== by.ownerId) {
+    throw new HttpError(403, "forbidden", "Only the room's creator can edit room settings");
+  }
+  if (r.kind !== "room") throw new HttpError(400, "invalid_room", "Direct messages cannot be renamed or change join policy");
+  if (r.archived_at) throw new HttpError(409, "room_archived", "Unarchive the room before editing it");
+
+  const nextName = b.name !== undefined ? str(b.name, "name", 100, true)!.trim() : r.name;
+  if (!nextName) throw new HttpError(400, "missing_field", "name cannot be empty");
+  const nextPolicy = b.join_policy !== undefined ? str(b.join_policy, "join_policy", 16, true)! : r.join_policy;
+  if (!JOIN_POLICIES.has(nextPolicy)) throw new HttpError(400, "invalid_field", "join_policy must be invite, request or open");
+
+  await env.DB.prepare("UPDATE rooms SET name = ?, join_policy = ? WHERE id = ?").bind(nextName, nextPolicy, roomId).run();
+  await audit(env, by.agent?.id ?? by.ownerId, "room.update", roomId, { name: nextName, join_policy: nextPolicy });
+  return { id: roomId, name: nextName, join_policy: nextPolicy };
+}
+
+/** Archive or unarchive a room. */
+export async function archiveRoom(ctx: Ctx, by: { ownerId: string; agent?: Agent }, roomId: string, archived: boolean) {
+  const { env } = ctx;
+  const r = await getRoomRow(env, roomId);
+  if (by.agent) {
+    const m = await membership(env, by.agent.id, roomId);
+    if (!m.can_manage) throw new HttpError(403, "forbidden", "This agent is not authorized to manage this room");
+  } else if (r.created_by !== by.ownerId && r.human_owner !== by.ownerId) {
+    throw new HttpError(403, "forbidden", "Only the room's creator can archive or unarchive it");
+  }
+  const now = archived ? Date.now() : null;
+  const actor = by.agent?.id ?? by.ownerId;
+  await env.DB.prepare("UPDATE rooms SET archived_at = ?, archived_by = ? WHERE id = ?")
+    .bind(now, archived ? actor : null, roomId).run();
+  await audit(env, actor, archived ? "room.archive" : "room.unarchive", roomId);
+  return { id: roomId, archived, archived_at: now };
+}
+
+/** Permanently delete a room and purge its Durable Object storage. Owner creator only. */
+export async function deleteRoom(ctx: Ctx, ownerId: string, roomId: string) {
+  const { env } = ctx;
+  const r = await getRoomRow(env, roomId);
+  if (r.created_by !== ownerId && r.human_owner !== ownerId) {
+    throw new HttpError(403, "forbidden", "Only the room's creator can delete it");
+  }
+  await room(env, roomId).purge();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM room_join_requests WHERE room_id = ?").bind(roomId),
+    env.DB.prepare("DELETE FROM invite_uses WHERE room_id = ?").bind(roomId),
+    env.DB.prepare("DELETE FROM invites WHERE room_id = ?").bind(roomId),
+    env.DB.prepare("UPDATE enroll_codes SET room_id = NULL, role = NULL, invite_id = NULL WHERE room_id = ?").bind(roomId),
+    env.DB.prepare("DELETE FROM memberships WHERE room_id = ?").bind(roomId),
+    env.DB.prepare("DELETE FROM rooms WHERE id = ?").bind(roomId),
+  ]);
+  await audit(env, ownerId, "room.delete", roomId, { name: r.name, kind: r.kind });
+  return { ok: true, id: roomId, deleted: true };
+}
+
+/** Add one or more same-owner active agents to a room (human owner or authorized agent). */
+export async function addRoomMembers(ctx: Ctx, by: { ownerId: string; agent?: Agent }, roomId: string, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const r = await getRoomRow(env, roomId);
+  if (r.kind !== "room") throw new HttpError(400, "invalid_room", "Cannot add members to a direct message");
+  if (r.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
+
+  if (by.agent) {
+    const m = await membership(env, by.agent.id, roomId);
+    if (!m.can_manage) throw new HttpError(403, "forbidden", "This agent is not authorized to add members to this room");
+  } else if (r.created_by !== by.ownerId && !(await ownerCanSeeRoom(env, by.ownerId, roomId))) {
+    throw new HttpError(404, "room_not_found");
+  }
+
+  const rawList = Array.isArray(b.agent_ids)
+    ? b.agent_ids.filter((x): x is string => typeof x === "string")
+    : typeof b.agent_id === "string" ? [b.agent_id] : [];
+  const ids = [...new Set(rawList.map((s) => s.trim()).filter(Boolean))].slice(0, 50);
+  if (!ids.length) throw new HttpError(400, "missing_field", "agent_id or agent_ids is required");
+
+  const role = (str(b.role, "role", 8) ?? "post") as "post" | "read";
+  if (role !== "post" && role !== "read") throw new HttpError(400, "invalid_field", "role must be post or read");
+  const canManage = bool(b.can_manage, "can_manage", false);
+
+  const { results } = await env.DB.prepare(
+    `SELECT id FROM agents WHERE owner_id = ? AND status = 'active' AND id IN (${ids.map(() => "?").join(",")})`,
+  ).bind(by.ownerId, ...ids).all<{ id: string }>();
+  if (results.length !== ids.length) {
+    throw new HttpError(403, "not_your_agent", "Can only add active agents of the same owner directly; use an invite for other owners");
+  }
+
+  const now = Date.now();
+  await env.DB.batch(ids.map((id) => env.DB.prepare(
+    `INSERT INTO memberships (room_id, agent_id, role, can_manage, joined_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(room_id, agent_id) DO UPDATE SET role = excluded.role, can_manage = excluded.can_manage`,
+  ).bind(roomId, id, role, canManage ? 1 : 0, now)));
+  await audit(env, by.agent?.id ?? by.ownerId, "membership.add", roomId, { agent_ids: ids, role, can_manage: canManage });
+  return { ok: true, room: roomId, added: ids, role, can_manage: canManage };
+}
+
+/** Update a member's role or can_manage flag. Room creator or the agent's owner. */
+export async function updateRoomMember(ctx: Ctx, ownerId: string, roomId: string, agentId: string, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const row = await env.DB.prepare(
+    `SELECT r.created_by, a.owner_id, m.role, m.can_manage FROM memberships m
+     JOIN rooms r ON r.id = m.room_id JOIN agents a ON a.id = m.agent_id
+     WHERE m.room_id = ? AND m.agent_id = ?`,
+  ).bind(roomId, agentId).first<{ created_by: string; owner_id: string; role: string; can_manage: number }>();
+  if (!row || (row.created_by !== ownerId && row.owner_id !== ownerId)) throw new HttpError(404, "member_not_found");
+  const role = (b.role !== undefined ? str(b.role, "role", 8, true)! : row.role) as "post" | "read";
+  if (role !== "post" && role !== "read") throw new HttpError(400, "invalid_field", "role must be post or read");
+  const canManage = b.can_manage !== undefined ? bool(b.can_manage, "can_manage", false) : Boolean(row.can_manage);
+  // Only the room's creator can grant can_manage.
+  if (canManage && !row.can_manage && row.created_by !== ownerId) {
+    throw new HttpError(403, "forbidden", "Only the room's creator can grant room management permission");
+  }
+  await env.DB.prepare("UPDATE memberships SET role = ?, can_manage = ? WHERE room_id = ? AND agent_id = ?")
+    .bind(role, canManage ? 1 : 0, roomId, agentId).run();
+  await audit(env, ownerId, "membership.update", roomId, { agent_id: agentId, role, can_manage: canManage });
+  return { ok: true, room: roomId, agent_id: agentId, role, can_manage: canManage };
+}
+
+/** Remove a member (owner creator, agent's owner, authorized agent for same-owner, or self-leave). */
+export async function removeRoomMember(ctx: Ctx, by: { ownerId: string; agent?: Agent }, roomId: string, agentId: string) {
+  const { env } = ctx;
+  const row = await env.DB.prepare(
+    `SELECT r.created_by, r.kind, a.owner_id FROM memberships m
+     JOIN rooms r ON r.id = m.room_id JOIN agents a ON a.id = m.agent_id
+     WHERE m.room_id = ? AND m.agent_id = ?`,
+  ).bind(roomId, agentId).first<{ created_by: string; kind: string; owner_id: string }>();
+  if (!row) throw new HttpError(404, "member_not_found");
+  if (by.agent) {
+    const isSelf = by.agent.id === agentId;
+    if (isSelf) {
+      if (row.kind !== "room") throw new HttpError(400, "invalid_room", "Cannot leave a direct message");
+    } else {
+      const caller = await membership(env, by.agent.id, roomId);
+      if (!caller.can_manage || row.owner_id !== by.ownerId) {
+        throw new HttpError(403, "forbidden", "Can only remove same-owner agents when authorized to manage this room");
+      }
+    }
+  } else if (row.created_by !== by.ownerId && row.owner_id !== by.ownerId) {
+    throw new HttpError(404, "member_not_found");
+  }
+  await env.DB.prepare("DELETE FROM memberships WHERE room_id = ? AND agent_id = ?").bind(roomId, agentId).run();
+  await audit(env, by.agent?.id ?? by.ownerId, "membership.remove", roomId, { agent_id: agentId });
+  return { ok: true, room: roomId, agent_id: agentId };
+}
+
+/** Non-DM, non-archived rooms this agent isn't in yet that it can join or request to join. */
+export async function discoverRooms(ctx: Ctx, agent: Agent) {
+  const { env } = ctx;
+  const { results } = await env.DB.prepare(
+    `SELECT r.id, r.name, r.created_by, r.join_policy, r.created_at,
+            (SELECT COUNT(*) FROM memberships m JOIN agents a ON a.id = m.agent_id WHERE m.room_id = r.id AND a.status = 'active') AS member_count,
+            (SELECT id FROM room_join_requests j WHERE j.room_id = r.id AND j.agent_id = ?1 AND j.status = 'pending' LIMIT 1) AS pending_request_id
+     FROM rooms r
+     WHERE r.kind = 'room' AND r.archived_at IS NULL
+       AND r.id NOT IN (SELECT room_id FROM memberships WHERE agent_id = ?1)
+       AND (
+         r.created_by = ?2
+         OR (
+           r.join_policy IN ('request', 'open')
+           AND r.created_by NOT IN (SELECT owner_id FROM contact_rules WHERE agent_id = ?1 AND rule = 'block')
+           AND r.created_by IN (
+             SELECT DISTINCT a2.owner_id FROM memberships m1
+             JOIN agents mine ON mine.id = m1.agent_id AND mine.owner_id = ?2
+             JOIN memberships m2 ON m2.room_id = m1.room_id
+             JOIN agents a2 ON a2.id = m2.agent_id AND a2.status = 'active'
+           )
+         )
+       )
+     ORDER BY (r.created_by = ?2) DESC, r.created_at DESC LIMIT 100`,
+  ).bind(agent.id, agent.owner_id).all<Record<string, any>>();
+  return {
+    rooms: results.map((r) => ({
+      id: r.id, name: r.name, created_by: r.created_by, join_policy: r.join_policy,
+      member_count: r.member_count,
+      can_join_directly: r.created_by === agent.owner_id && r.join_policy === "open",
+      pending_request_id: r.pending_request_id ?? null,
+    })),
+  };
+}
+
+/** Agent self-join: joins immediately if same-owner + open, otherwise creates a join request for the room's owner. */
+export async function requestJoinRoom(ctx: Ctx, agent: Agent, roomId: string, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const r = await env.DB.prepare(
+    "SELECT id, name, kind, created_by, archived_at, join_policy FROM rooms WHERE id = ?",
+  ).bind(roomId).first<RoomRow>();
+  if (!r || r.kind !== "room" || r.archived_at) throw new HttpError(404, "room_not_found");
+
+  const already = await env.DB.prepare("SELECT 1 AS ok FROM memberships WHERE room_id = ? AND agent_id = ?")
+    .bind(roomId, agent.id).first();
+  if (already) return { status: 200, body: { status: "joined", room: roomId, already_member: true } };
+
+  const sameOwner = r.created_by === agent.owner_id;
+  if (!sameOwner) {
+    if (r.join_policy === "invite") throw new HttpError(404, "room_not_found");
+    const blocked = await env.DB.prepare("SELECT 1 AS ok FROM contact_rules WHERE owner_id = ? AND agent_id = ? AND rule = 'block'")
+      .bind(r.created_by, agent.id).first();
+    if (blocked) throw new HttpError(403, "not_allowed", "This owner doesn't accept requests from this agent");
+    const inNetwork = await env.DB.prepare(
+      `SELECT 1 AS ok FROM memberships m1
+       JOIN agents mine ON mine.id = m1.agent_id AND mine.owner_id = ?1
+       JOIN memberships m2 ON m2.room_id = m1.room_id
+       JOIN agents a2 ON a2.id = m2.agent_id AND a2.owner_id = ?2 AND a2.status = 'active' LIMIT 1`,
+    ).bind(agent.owner_id, r.created_by).first();
+    if (!inNetwork) throw new HttpError(404, "room_not_found");
+  }
+
+  if (sameOwner && r.join_policy === "open") {
+    await addMember(env, roomId, agent.id, "post", false);
+    await audit(env, agent.id, "room.join", roomId);
+    return { status: 200, body: { status: "joined", room: roomId } };
+  }
+
+  const existing = await env.DB.prepare(
+    "SELECT id FROM room_join_requests WHERE room_id = ? AND agent_id = ? AND status = 'pending'",
+  ).bind(roomId, agent.id).first<{ id: string }>();
+  if (existing) {
+    return { status: 202, body: { status: "pending", request_id: existing.id, room: roomId, approval_url: approvalUrl(ctx, existing.id) } };
+  }
+  const pending = await env.DB.prepare("SELECT COUNT(*) AS n FROM room_join_requests WHERE agent_id = ? AND status = 'pending'")
+    .bind(agent.id).first<{ n: number }>();
+  if ((pending?.n ?? 0) >= MAX_PENDING_PER_AGENT) throw new HttpError(429, "too_many_pending", "Too many room join requests waiting for approval");
+
+  const id = newId("jreq");
+  const note = str(b.note, "note", 500) ?? null;
+  await env.DB.prepare(
+    `INSERT INTO room_join_requests (id, room_id, agent_id, agent_owner, room_owner, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(id, roomId, agent.id, agent.owner_id, r.created_by, note, Date.now()).run();
+  await audit(env, agent.id, "room.join_request", id, { room: roomId, room_owner: r.created_by });
+  await ownerNotice(ctx, r.created_by, "join_request_pending", id, { room: roomId, agent_id: agent.id });
+  return { status: 202, body: { status: "pending", request_id: id, room: roomId, approval_url: approvalUrl(ctx, id) } };
+}
+
+/** The room's creator approves or denies a room join request. */
+export async function decideJoinRequest(ctx: Ctx, owner: Owner, id: string, b: Record<string, unknown>) {
+  const { env } = ctx;
+  const action = str(b.action, "action", 16, true)!;
+  if (action !== "approve" && action !== "deny") throw new HttpError(400, "invalid_action", "action must be approve or deny");
+  const row = await env.DB.prepare(
+    "SELECT id, room_id, agent_id, agent_owner, room_owner, status FROM room_join_requests WHERE id = ? AND room_owner = ?",
+  ).bind(id, owner.id).first<{ id: string; room_id: string; agent_id: string; agent_owner: string; room_owner: string; status: string }>();
+  if (!row) throw new HttpError(404, "join_request_not_found");
+  if (row.status !== "pending") throw new HttpError(409, "already_decided", `This request was already ${row.status}`);
+
+  const now = Date.now();
+  const status = action === "approve" ? "approved" : "denied";
+  const role = (str(b.role, "role", 8) ?? "post") as "post" | "read";
+  if (role !== "post" && role !== "read") throw new HttpError(400, "invalid_field", "role must be post or read");
+  const canManage = bool(b.can_manage, "can_manage", false);
+
+  const claimed = await env.DB.prepare(
+    "UPDATE room_join_requests SET status = ?, role = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'",
+  ).bind(status, role, now, owner.id, id).run();
+  if (!claimed.meta.changes) throw new HttpError(409, "already_decided");
+
+  if (action === "approve") {
+    const active = await env.DB.prepare("SELECT 1 AS ok FROM agents WHERE id = ? AND status = 'active'").bind(row.agent_id).first();
+    if (!active) throw new HttpError(409, "requester_gone", "The requesting agent was revoked");
+    await addMember(env, row.room_id, row.agent_id, role, canManage);
+  }
+  await audit(env, owner.id, `join_request.${action}`, id, { room: row.room_id, agent_id: row.agent_id, role });
+  const event: ApprovalEvent = { kind: "approval", id, status: action === "approve" ? "allowed" : "denied", room: action === "approve" ? row.room_id : null };
+  ctx.waitUntil(agentHub(env, row.agent_id).notify(event).catch(() => 0));
+  return { id, status, room: row.room_id, agent_id: row.agent_id, ...(action === "approve" ? { role, can_manage: canManage } : {}) };
 }
