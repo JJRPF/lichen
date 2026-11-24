@@ -121,9 +121,10 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
   if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
   if (p === "/react" && m === "POST") return react(req, ctx, agent);
-  const msgRoute = /^\/messages\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  const msgRoute = /^\/messages\/(r_[a-z0-9]+(?::|%3A)\d+)(\/delete)?$/i.exec(p);
   if (msgRoute) {
-    const { roomId, seq } = parseMessageId(msgRoute[1]);
+    const msgId = decodeURIComponent(msgRoute[1]);
+    const { roomId, seq } = parseMessageId(msgId);
     if (!msgRoute[2] && (m === "PATCH" || m === "POST")) {
       const b = await readBody(req);
       const body = str(b.body, "body", 1_000_000, true)!;
@@ -131,15 +132,15 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
       const fanout = await postingMembership(env, agent, roomId);
       const res = await room(env, roomId).editMessage(seq, body, agent.id, agent.owner_id, false, fanout.owners ?? [], roomId);
       if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : res.error === "not_editable" ? 400 : 404, res.error);
-      await audit(env, agent.id, "message.edit", msgRoute[1]);
+      await audit(env, agent.id, "message.edit", msgId);
       return json({ message: present(agent.owner_id, roomId, res.message, { agentId: agent.id, direct: !!fanout.direct }) });
     }
     if ((m === "DELETE" && !msgRoute[2]) || (m === "POST" && msgRoute[2] === "/delete")) {
       const fanout = await postingMembership(env, agent, roomId);
       const res = await room(env, roomId).deleteMessage(seq, agent.id, agent.owner_id, false, fanout.owners ?? [], roomId);
       if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : 404, res.error);
-      await audit(env, agent.id, "message.delete", msgRoute[1]);
-      return json({ ok: true, id: msgRoute[1], deleted_at: res.deleted_at });
+      await audit(env, agent.id, "message.delete", msgId);
+      return json({ ok: true, id: msgId, deleted_at: res.deleted_at });
     }
   }
   if (p === "/pins" && m === "GET") {
@@ -159,15 +160,16 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
     await audit(env, agent.id, "pin.add", id);
     return json({ ok: true, id, pinned_at: res.pinned_at }, 201);
   }
-  const pinDel = /^\/pins\/(r_[a-z0-9]+:\d+)$/.exec(p);
+  const pinDel = /^\/pins\/(r_[a-z0-9]+(?::|%3A)\d+)$/i.exec(p);
   if (pinDel && m === "DELETE") {
-    const { roomId, seq } = parseMessageId(pinDel[1]);
+    const pinId = decodeURIComponent(pinDel[1]);
+    const { roomId, seq } = parseMessageId(pinId);
     const fanout = await postingMembership(env, agent, roomId);
     if (!(await room(env, roomId).unpinMessage(seq, agent.id, agent.owner_id, fanout.owners ?? [], roomId))) {
       throw new HttpError(404, "pin_not_found");
     }
-    await audit(env, agent.id, "pin.remove", pinDel[1]);
-    return json({ ok: true, id: pinDel[1], unpinned: true });
+    await audit(env, agent.id, "pin.remove", pinId);
+    return json({ ok: true, id: pinId, unpinned: true });
   }
   if (p === "/search" && m === "GET") {
     const q = url.searchParams.get("q") ?? "";

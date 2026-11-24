@@ -241,9 +241,10 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     await attachImages(ctx, roomId, owner.id, b, meta);
     return json(await sendAsOwner(ctx, owner.id, roomId, text, meta, fanout), 201);
   }
-  const om = /^\/owner\/messages\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  const om = /^\/owner\/messages\/(r_[a-z0-9]+(?::|%3A)\d+)(\/delete)?$/i.exec(p);
   if (om) {
-    const { roomId, seq } = parseMessageId(om[1]);
+    const msgId = decodeURIComponent(om[1]);
+    const { roomId, seq } = parseMessageId(msgId);
     if (!om[2] && (m === "PATCH" || m === "POST")) {
       const b = await readBody(req);
       const body = str(b.body, "body", 1_000_000, true)!;
@@ -251,7 +252,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
       const fanout = await ownerFanout(env, owner.id, roomId);
       const res = await room(env, roomId).editMessage(seq, body, owner.id, owner.id, true, fanout.owners ?? [owner.id], roomId);
       if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : res.error === "not_editable" ? 400 : 404, res.error);
-      await audit(env, owner.id, "message.edit", om[1]);
+      await audit(env, owner.id, "message.edit", msgId);
       return json({ message: present(owner.id, roomId, res.message) });
     }
     if ((m === "DELETE" && !om[2]) || (m === "POST" && om[2] === "/delete")) {
@@ -259,10 +260,10 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
       const rRow = await env.DB.prepare("SELECT created_by, archived_at FROM rooms WHERE id = ?").bind(roomId).first<{ created_by: string; archived_at: number | null }>();
       if (rRow?.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
       const owners = (await roomMembers(env, roomId)).map((x) => x.owner_id);
-      const res = await room(env, roomId).deleteMessage(seq, owner.id, owner.id, rRow?.created_by === owner.id, [...owners, owner.id], roomId);
+      const res = await room(env, roomId).deleteMessage(seq, owner.id, owner.id, rRow?.created_by === owner.id || rRow?.created_by === "admin", [...owners, owner.id], roomId);
       if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : 404, res.error);
-      await audit(env, owner.id, "message.delete", om[1]);
-      return json({ ok: true, id: om[1], deleted_at: res.deleted_at });
+      await audit(env, owner.id, "message.delete", msgId);
+      return json({ ok: true, id: msgId, deleted_at: res.deleted_at });
     }
   }
   if (p === "/owner/pins" && m === "GET") {
@@ -281,15 +282,16 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
     await audit(env, owner.id, "pin.add", id);
     return json({ ok: true, id, pinned_at: res.pinned_at }, 201);
   }
-  const op = /^\/owner\/pins\/(r_[a-z0-9]+:\d+)(\/delete)?$/.exec(p);
+  const op = /^\/owner\/pins\/(r_[a-z0-9]+(?::|%3A)\d+)(\/delete)?$/i.exec(p);
   if (op && ((m === "DELETE" && !op[2]) || (m === "POST" && op[2] === "/delete"))) {
-    const { roomId, seq } = parseMessageId(op[1]);
+    const pinId = decodeURIComponent(op[1]);
+    const { roomId, seq } = parseMessageId(pinId);
     const fanout = await ownerFanout(env, owner.id, roomId);
     if (!(await room(env, roomId).unpinMessage(seq, owner.id, owner.id, fanout.owners ?? [owner.id], roomId))) {
       throw new HttpError(404, "pin_not_found");
     }
-    await audit(env, owner.id, "pin.remove", op[1]);
-    return json({ ok: true, id: op[1], unpinned: true });
+    await audit(env, owner.id, "pin.remove", pinId);
+    return json({ ok: true, id: pinId, unpinned: true });
   }
   if (p === "/owner/search" && m === "GET") {
     const q = url.searchParams.get("q") ?? "";
