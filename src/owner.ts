@@ -194,7 +194,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
         id: r.id, name: r.name, kind: r.kind, created_by: r.created_by, created_at: r.created_at,
         human_owner: r.human_owner, archived_at: r.archived_at ?? null, join_policy: r.join_policy ?? "request",
         auto_pause: r.auto_pause !== 0,
-        can_manage: r.created_by === owner.id || r.human_owner === owner.id || r.created_by === "admin",
+        can_manage: r.created_by === owner.id || r.human_owner === owner.id || !String(r.created_by).startsWith("github:"),
         members: [],
       };
       if (r.agent_id) {
@@ -260,7 +260,7 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
       const rRow = await env.DB.prepare("SELECT created_by, archived_at FROM rooms WHERE id = ?").bind(roomId).first<{ created_by: string; archived_at: number | null }>();
       if (rRow?.archived_at) throw new HttpError(409, "room_archived", "This room is archived");
       const owners = (await roomMembers(env, roomId)).map((x) => x.owner_id);
-      const res = await room(env, roomId).deleteMessage(seq, owner.id, owner.id, rRow?.created_by === owner.id || rRow?.created_by === "admin", [...owners, owner.id], roomId);
+      const res = await room(env, roomId).deleteMessage(seq, owner.id, owner.id, rRow?.created_by === owner.id || (!!rRow && !rRow.created_by.startsWith("github:")), [...owners, owner.id], roomId);
       if (!res.ok) throw new HttpError(res.error === "forbidden" ? 403 : 404, res.error);
       await audit(env, owner.id, "message.delete", msgId);
       return json({ ok: true, id: msgId, deleted_at: res.deleted_at });

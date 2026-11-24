@@ -521,10 +521,10 @@ async function getRoomRow(env: Env, roomId: string): Promise<RoomRow> {
   return r;
 }
 
-/** An owner can manage a room if they created it, it's their human DM, or it's an admin-created room they belong to. */
+/** An owner can manage a room if they created it, it's their human DM, or it's a system/operator-created room they belong to. */
 async function canOwnerManageRoom(env: Env, ownerId: string, r: RoomRow): Promise<boolean> {
   if (r.created_by === ownerId || r.human_owner === ownerId) return true;
-  if (r.created_by === "admin") return ownerCanSeeRoom(env, ownerId, r.id);
+  if (!r.created_by.startsWith("github:")) return ownerCanSeeRoom(env, ownerId, r.id);
   return false;
 }
 
