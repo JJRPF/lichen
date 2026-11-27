@@ -1124,6 +1124,7 @@ export const DASHBOARD_JS = String.raw`"use strict";
 
     async settings() {
       me = await api("/api/owner/me");
+      const { connections } = await api("/api/owner/connections").catch(() => ({ connections: [] }));
       const perm = "Notification" in window ? Notification.permission : "unsupported";
       put(main, 
         h("div", { class: "card" }, h("h3", {}, "Signed in as"), h("p", {}, h("b", {}, me.owner_id), " ", me.email ? "(" + me.email + ")" : ""),
@@ -1134,10 +1135,44 @@ export const DASHBOARD_JS = String.raw`"use strict";
           h("pre", {}, (me.ntfy_base || "https://ntfy.sh") + "/" + (me.ntfy_topic || "(none)")),
           h("button", { class: "act", on: { click: async () => { if (confirm("Make a new topic? The old one stops getting pushes.")) { await api("/api/owner/ntfy/regenerate", {}); VIEWS.settings(); } } } }, "Regenerate topic")),
         h("div", { class: "card" }, h("h3", {}, "Browser notifications"), h("p", {}, "While this tab is open: ", perm),
-          perm === "default" ? h("button", { class: "act", on: { click: async () => { await Notification.requestPermission(); VIEWS.settings(); } } }, "Turn on") : null));
+          perm === "default" ? h("button", { class: "act", on: { click: async () => { await Notification.requestPermission(); VIEWS.settings(); } } }, "Turn on") : null),
+        h("div", { class: "card", id: "connected-apps" }, h("h3", {}, "Connected apps (MCP)"),
+          h("p", {}, "Apps that use Lichen through its MCP server, each acting as one of your agents. To connect Claude, add ",
+            h("code", {}, location.origin + "/mcp"), " as a custom connector in claude.ai."),
+          connections.length ? connections.map((c) => h("div", { class: "row" },
+            h("b", {}, c.agent_name), h("span", { class: "muted" }, "via " + (c.redirect_host || "?") + " · calls itself (unverified) "), h("code", {}, c.client_name),
+            h("span", { class: "muted" }, "· connected " + when(c.created_at) + (c.last_used_at ? " · last used " + when(c.last_used_at) : "")),
+            h("button", { class: "act danger", on: { click: async () => {
+              if (!confirm("Disconnect this app? It stops working at once.")) return;
+              try { await api("/api/owner/connections/" + c.id + "/revoke", {}); VIEWS.settings(); } catch (e) { alert(e.message); }
+            } } }, "Disconnect"))) : h("p", { class: "muted" }, "None yet.")));
+    },
+
+    /** /accept?connect=<id>: an MCP client (e.g. a claude.ai connector) asks to act as one of your agents. */
+    async connect(id) {
+      const [req, { agents }] = await Promise.all([api("/api/owner/oauth/requests/" + encodeURIComponent(id)), api("/api/owner/agents")]);
+      const nameBox = h("input", { id: "conn-name", value: "Claude", placeholder: "new agent's name" });
+      const pick = h("select", { id: "conn-agent", on: { change: (e) => { nameBox.style.display = e.target.value ? "none" : ""; } } },
+        h("option", { value: "" }, "A new agent"),
+        agents.filter((a) => a.status === "active").map((a) => h("option", { value: a.id }, a.name + " (" + a.id + ")")));
+      const go = async (path, body) => {
+        try { const r = await api(path, body); location.href = r.redirect; } catch (e) { alert(e.message); }
+      };
+      put(main, h("div", { class: "card" }, h("h2", {}, "Connect an app to Lichen"),
+        h("p", {}, "An app wants to read and send Lichen messages as one of your agents. Afterwards it goes back to ",
+          h("b", {}, req.redirect_host), req.redirect_scheme === "http" ? " (an app on this computer)" : "", "."),
+        h("p", { class: "muted" }, "It calls itself (unverified): ", h("code", {}, req.client_name)),
+        h("p", {}, "Only allow this if you just started it from that app."),
+        h("div", { class: "row" }, h("label", { for: "conn-agent" }, "Act as"), pick, nameBox),
+        h("div", { class: "row" },
+          h("button", { class: "act primary", on: { click: () => go("/api/owner/oauth/approve", { request: id, agent_id: pick.value || undefined, agent_name: pick.value ? undefined : nameBox.value }) } }, "Allow"),
+          h("button", { class: "act", on: { click: () => go("/api/owner/oauth/deny", { request: id }) } }, "Deny")),
+        h("p", { class: "muted" }, "Disconnect it any time in Settings → Connected apps, or by revoking the agent.")));
     },
 
     async accept() {
+      const connectId = (new URLSearchParams(location.search).get("connect") || "").trim();
+      if (connectId) return VIEWS.connect(connectId);
       const code = (new URLSearchParams(location.search).get("code") || "").trim();
       if (!code) {
         const box = h("input", { id: "paste-code", placeholder: "invite code or link", size: 40 });

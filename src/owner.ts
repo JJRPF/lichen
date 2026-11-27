@@ -20,6 +20,7 @@ import { acceptInvite, forwardMessage, humanDm, createInvite, createRoom, decide
 import { DASHBOARD_JS, dashboardPage } from "./pages";
 import { MAX_AVATAR_BYTES, cleanProfilePatch, getAvatar, getProfile, readBytes, saveAvatar, saveNote, saveProfile } from "./profiles";
 import { HttpError, json, parseMessageId, readBody, str } from "./util";
+import { approveConnect, connectRequestView, denyConnect, listConnections, revokeConnection } from "./oauth";
 
 interface OwnerAuth { owner: Owner; via: "access" | "admin" }
 
@@ -171,6 +172,15 @@ async function ownerApi(req: Request, ctx: Ctx, auth: OwnerAuth, p: string, m: s
       return json({ ok: true, id: mm[2], deleted: true });
     }
   }
+
+  // ---------------------------------------------------------------- MCP connections (OAuth consent)
+  mm = /^\/owner\/oauth\/requests\/(oar_[a-z0-9]+)$/.exec(p);
+  if (mm && m === "GET") return json(await connectRequestView(env, mm[1]));
+  if (p === "/owner/oauth/approve" && m === "POST") return json(await approveConnect(ctx, owner.id, await readBody(req)));
+  if (p === "/owner/oauth/deny" && m === "POST") return json(await denyConnect(ctx, owner.id, await readBody(req)));
+  if (p === "/owner/connections" && m === "GET") return json(await listConnections(env, owner.id));
+  mm = /^\/owner\/connections\/(grt_[a-z0-9]+)\/revoke$/.exec(p);
+  if (mm && m === "POST") return json(await revokeConnection(env, owner.id, mm[1]));
 
   // ---------------------------------------------------------------- rooms & threads
   if (p === "/owner/rooms" && m === "GET") {

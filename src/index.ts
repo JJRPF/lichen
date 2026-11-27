@@ -20,6 +20,8 @@ import {
 import { ownerRoute, pageRoute } from "./owner";
 import { homePage, invitePage, wantsHtml } from "./pages";
 import { agentGuide } from "./guide";
+import { authServer, oauthRoute, protectedResource } from "./oauth";
+import { type AgentCall, mcpRoute } from "./mcp";
 
 /** Accept: text/markdown (and not HTML first), e.g. an agent fetching the homepage. */
 const prefersMarkdown = (req: Request) => {
@@ -42,15 +44,19 @@ export default {
     try {
       return await route(req, ctx);
     } catch (err) {
-      const e = err as HttpError & { retryAfterMs?: number };
-      if (e instanceof HttpError && e.code === "cooldown") {
-        const ms = e.retryAfterMs ?? 1000;
-        return json({ error: "cooldown", retry_after_ms: ms }, 429, { "retry-after": String(Math.ceil(ms / 1000)) });
-      }
-      return errorResponse(err);
+      return toResponse(err);
     }
   },
 } satisfies ExportedHandler<Env>;
+
+function toResponse(err: unknown): Response {
+  const e = err as HttpError & { retryAfterMs?: number };
+  if (e instanceof HttpError && e.code === "cooldown") {
+    const ms = e.retryAfterMs ?? 1000;
+    return json({ error: "cooldown", retry_after_ms: ms }, 429, { "retry-after": String(Math.ceil(ms / 1000)) });
+  }
+  return errorResponse(err);
+}
 
 /**
  * Browser pages live at the root (/, /dashboard, /approvals, /accept and the
@@ -66,6 +72,18 @@ async function route(req: Request, ctx: Ctx): Promise<Response> {
     return json({ service: "lichen", version: VERSION, docs: `${ctx.origin}/#api` });
   }
   if (p.startsWith("/api/")) return apiRoute(req, ctx, p.slice(4), req.method, url);
+
+  // Optional remote MCP server and the OAuth it needs (claude.ai custom connectors and other MCP clients).
+  if (p === "/mcp") return mcpRoute(req, ctx, agentCall(ctx));
+  if (p.startsWith("/oauth/")) return oauthRoute(req, ctx, p);
+  if (p === "/.well-known/oauth-protected-resource" || p === "/.well-known/oauth-protected-resource/mcp") {
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } });
+    if (isGet) return protectedResource(ctx.origin);
+  }
+  if (p === "/.well-known/oauth-authorization-server") {
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*" } });
+    if (isGet) return authServer(ctx.origin);
+  }
 
   if (isGet) {
     // Agents read the Markdown guide; browsers get the homepage.
@@ -98,7 +116,29 @@ async function apiRoute(req: Request, ctx: Ctx, p: string, m: string, url: URL):
 
   if (p.startsWith("/owner/")) return ownerRoute(req, ctx, p, m, url);
 
-  const agent = await authAgent(req, env);
+  return agentRoute(req, ctx, await authAgent(req, env), p, m, url);
+}
+
+/** Runs an agent API request inside the Worker as `agent` (used by /mcp tools). */
+const agentCall = (ctx: Ctx): AgentCall => async (agent, method, path, body) => {
+  const url = new URL(`${ctx.origin}/api${path}`);
+  const req = new Request(url, {
+    method,
+    headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let res: Response;
+  try {
+    res = await agentRoute(req, ctx, agent, url.pathname.slice(4).replace(/\/+$/, ""), method, url);
+  } catch (err) {
+    res = toResponse(err);
+  }
+  return { status: res.status, data: await res.json().catch(() => ({})) };
+};
+
+/** Agent routes, after the bearer token is checked. */
+async function agentRoute(req: Request, ctx: Ctx, agent: Agent, p: string, m: string, url: URL): Promise<Response> {
+  const { env } = ctx;
   if (p === "/rooms" && m === "GET") return listRooms(env, agent);
   if (p === "/agents" && m === "GET") return json(await findAgents(ctx, agent, url.searchParams.get("q") ?? ""));
   if (p === "/send" && m === "POST") return send(req, ctx, agent);
