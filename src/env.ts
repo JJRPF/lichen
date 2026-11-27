@@ -6,7 +6,7 @@
 import type { Room, MessageMeta } from "./room";
 import type { AgentSocket } from "./agent";
 
-export const VERSION = "0.10.0";
+export const VERSION = "0.11.0";
 
 export interface Env {
   DB: D1Database;
@@ -33,6 +33,8 @@ export interface Env {
   ROUTINE_API_ORIGIN?: string;
   /** Minimum ms between two fires of one routine webhook. Default 120000 (30 an hour, the routine cap). */
   ROUTINE_MIN_INTERVAL_MS?: string;
+  /** MCP OAuth: https hosts allowed as redirect URIs (comma-separated; subdomains count). Default "claude.ai,claude.com". Loopback http is always allowed. */
+  OAUTH_REDIRECT_HOSTS?: string;
 }
 
 export type TrustTier = "same_owner" | "external";

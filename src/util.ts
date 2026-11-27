@@ -32,11 +32,11 @@ export function randomString(length: number, alphabet = ALPHABET): string {
 export const newId = (prefix: string, length = 12) => `${prefix}_${randomString(length)}`;
 
 /** 256-bit bearer token. Only its hash is stored. */
-export function newToken(): string {
+export function newToken(prefix = "lch"): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   let b64 = btoa(String.fromCharCode(...bytes));
   b64 = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `lch_${b64}`;
+  return `${prefix}_${b64}`;
 }
 
 export async function sha256Hex(input: string): Promise<string> {
